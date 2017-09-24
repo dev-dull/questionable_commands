@@ -7,7 +7,7 @@ if [ ! -f "$SVG_FILE" ]; then
 fi
 
 # find all (f)iles, don't touch system directories, leave fonts alone, ignore the image we're using
-find / -type f | grep -Ev "$SVG_FILE|^(/boot|/sys|/proc)|\.(ttf|otf)$" | while read "fname"
+find / -type f -mount | grep -Ev "$SVG_FILE|^(/boot|/sys|/proc)|\.(ttf|otf)$" | while read "fname"
 do
   is_emtpy=$(file "$fname" | grep -Eio 'empty$')
   if [ -z "$is_empty" ]; then
@@ -16,12 +16,6 @@ do
     if [ $is_img -eq 0 ]; then
       let width=$(echo "$img_info" | awk -Fx '{print $1}')
       let height=$(echo "$img_info" | awk -Fx '{print $2}')
-
-      #set the scale(???) of the original SVG so the final pic looks more better-er'd
-      density=$height
-      if [ $width -gt $height ]; then
-        density=$width # use whichever number is larger
-      fi
 
       if [ $width -gt 0 -a $height -gt 0 ]; then
         # get the file owner/group
