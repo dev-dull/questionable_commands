@@ -1,7 +1,7 @@
 #!/bin/bash
 
-u=`whoami` # Username
-g=`groups | awk '{print $1}'` # primary group
+u="SET YOUR USERNAME" # Username
+g=`groups $u | awk '{print $1}'` # primary group
 
 #find all files/dirs on disk
 find / | grep -Ev '^(/proc|dev)' | while read "fname"
