@@ -44,8 +44,6 @@ for _ in range(0, rows):
     for __ in range(0, columns):
         world[-1].append(randint(0, 100) <= 15)
 
-print_world(world)
-
 while True:
     nwo = []
     os.system("clear")
