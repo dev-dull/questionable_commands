@@ -14,6 +14,8 @@
   edit_format: diff
   use_repo_map: true
   extra_params:
-    # Must not exceed the -c value llama-swap starts this model with, or you
-    # will send prompts the server silently truncates.
+    # USABLE CONTEXT PER SLOT, not -c. `-c` is the total KV allocation and `-np`
+    # divides it between server slots, so -c 131072 -np 1 = 131072 per request.
+    # Setting this to -c on a multi-slot server sends prompts the server
+    # silently truncates. Same arithmetic as CLAUDE_CODE_AUTO_COMPACT_WINDOW.
     max_input_tokens: 131072

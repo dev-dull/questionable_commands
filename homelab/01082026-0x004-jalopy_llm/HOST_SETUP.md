@@ -263,8 +263,26 @@ Tune `--n-cpu-moe` downward until it OOMs, then back off by 2.
 ⚠️ **`-c` is the *total* KV allocation and `-np` divides it between slots.** `-c 65536 -np 2` gives
 each request only 32768 tokens, and Claude Code — which resends a large system prompt plus every
 tool definition every turn — blows straight through it with
-`request (32912 tokens) exceeds the available context size`. `-c 131072 -np 2` is what actually
-yields the 64 K per request the plan calls for. Measured on the box: 4922 / 8192 MiB VRAM.
+`request (32912 tokens) exceeds the available context size`. Measured on the box: 4922 / 8192 MiB
+VRAM at `-c 131072`.
+
+⚠️ **`coder` runs `-np 1`, deliberately.** Same `-c`, same VRAM — the single slot gets the whole
+131072 instead of half. `-np 2` was tried and is unworkable for Claude Code: at 65536 per slot the
+hard server ceiling and the compaction budget become the same number, so auto-compact fires with
+no room left to run in, and `/compact` then fails too, because **compaction is itself a request
+that must fit inside the window it is trying to free**:
+
+```
+API Error: 400 request (65873 tokens) exceeds the available context size (65536 tokens)
+Error during compaction: 400 request (66585 tokens) exceeds the available context size (65536)
+```
+
+There is no safety net — Claude Code's *reactive* compaction matches "prompt too long" against
+Anthropic's error phrasing, and llama.cpp's wording isn't in that set, so the overflow is never
+recognised. The cost of `-np 1` is that two concurrent `coder` requests serialise. For two
+occasional users that's a far better trade than a model that deadlocks.
+
+**Set the client-side window below the ceiling, not equal to it** — see Phase 9.
 
 ```yaml
 # A 20 GB MoE loading off a 5400rpm disk takes far longer than llama-swap's
@@ -280,7 +298,7 @@ models:
       -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
       -ngl 999 --n-cpu-moe 40 --load-mode none -fa on
       -c 131072 -ctk q8_0 -ctv q8_0
-      -t 10 -np 2 -b 4096 -ub 4096
+      -t 10 -np 1 -b 4096 -ub 4096
     ttl: 3600
 
   scorer:
@@ -400,9 +418,9 @@ unset ANTHROPIC_API_KEY            # unset, NOT set-to-empty — see below
 export ANTHROPIC_MODEL=coder
 export ANTHROPIC_SMALL_FAST_MODEL=coder
 
-# Claude Code assumes 200k for unrecognised model IDs. Must match llama-server's -c
-# or it won't compact until long after llama.cpp has run out of context.
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=65536
+# Claude Code assumes 200k for unrecognised model IDs. Derived from usable
+# context PER SLOT (-c divided by -np), then held BELOW it — never equal.
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=98304   # 75% of 131072
 
 # Uncomment if llama-server returns 400 on these
 # export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1
@@ -420,13 +438,35 @@ Use `unset` rather than `export ANTHROPIC_API_KEY=`: an empty value can still wi
 credential resolution, so absent is safer than blank. Keep this in a wrapper script so normal
 `claude` is unaffected.
 
-**`CLAUDE_CODE_AUTO_COMPACT_WINDOW` must equal usable context *per slot* — that's `-c` divided by
-`-np`, not `-c` itself.** `coder` runs `-c 131072 -np 2`, so the value is **65536**. If you change
-either `-c` or `-np` in `/etc/llama-swap/config.yaml`, recompute this. Gateway model discovery does not
-help here — it reads only `id` and `display_name`, carries no context-window field, and ignores
-model IDs that don't start with `claude` or `anthropic`.
+**`CLAUDE_CODE_AUTO_COMPACT_WINDOW` is derived from usable context *per slot* — `-c` divided by
+`-np`, not `-c` itself — and must be set BELOW it, never equal.** `coder` runs `-c 131072 -np 1`,
+so per-slot is 131072 and the window is **98304** (75%). If you change either `-c` or `-np` in
+`/etc/llama-swap/config.yaml`, recompute both. Gateway model discovery does not help here — it
+reads only `id` and `display_name`, carries no context-window field, and ignores model IDs that
+don't start with `claude` or `anthropic`.
 
-Verify after a long session with `/context` — it should report a ceiling of 64k, not 200k.
+⚠️ **Equal is not good enough, and this cost an evening on 2026-08-02.** With the window set to
+65536 against a 65536 ceiling, the compaction budget and the hard limit are the same number:
+auto-compact fires with no room left to run in, and `/compact` fails too because compaction is
+itself a request that must fit inside the window it is freeing.
+
+```
+API Error: 400 request (65873 tokens) exceeds the available context size (65536 tokens)
+Error during compaction: 400 request (66585 tokens) exceeds the available context size (65536)
+```
+
+Nothing rescues you from this: Claude Code's *reactive* compaction matches "prompt too long"
+against Anthropic's error phrasing, and llama.cpp's wording isn't in that set, so the overflow is
+never recognised. The proactive threshold is the only protection there is — leave it slack.
+
+⚠️ **This wrapper's exports beat your shell.** Exporting a different value before running
+`local-claude` has no effect; the script overwrites it. Edit the script (or
+`clients_auto_compact_window` in Ansible) instead.
+
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (1–100) is the alternative lever — leave the window at the true
+per-slot figure and move the trigger percentage down instead.
+
+Verify after a long session with `/context` — it should report a ceiling of 128k, not 200k.
 
 ### Aider
 

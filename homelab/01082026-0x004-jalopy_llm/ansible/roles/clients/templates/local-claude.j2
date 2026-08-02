@@ -28,7 +28,14 @@ export ANTHROPIC_SMALL_FAST_MODEL={{ clients_model }}
 # which point llama.cpp has long since run out of context and started dropping
 # the oldest tokens without telling anyone.
 #
-# This is usable context PER SLOT: `-c` divided by `-np`, not `-c`.
+# Derived from usable context PER SLOT (`-c` divided by `-np`), then held BELOW
+# it — see roles/clients/defaults/main.yml for why equalling the ceiling
+# deadlocks compaction.
+#
+# NOTE: this export WINS over anything you set in your shell. If you are
+# experimenting with the threshold, change clients_auto_compact_window and
+# re-run the role — exporting a different value before calling this script has
+# no effect, which is exactly how 2026-08-02 was misdiagnosed.
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW={{ clients_auto_compact_window }}
 
 # Fail loudly if the box is not reachable, rather than letting Claude Code fall

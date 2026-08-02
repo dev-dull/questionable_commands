@@ -13,10 +13,23 @@ clients_model: coder
 # that hardcoded default. Without this it won't auto-compact until ~167k, long
 # after llama.cpp has run out and started silently dropping the oldest tokens.
 #
-# This must equal USABLE CONTEXT PER SLOT, which is `-c` DIVIDED BY `-np`,
-# not `-c` itself:  coder runs -c 131072 -np 2  ->  65536 per request.
-# If you change either -c or -np in aihost_models, change this to match.
-clients_auto_compact_window: 65536
+# Base figure is USABLE CONTEXT PER SLOT, which is `-c` DIVIDED BY `-np`, not
+# `-c` itself:  coder runs -c 131072 -np 1  ->  131072 per request.
+#
+# But DO NOT set this equal to the per-slot ceiling. That was the 2026-08-02
+# failure: at 65536/65536 the compaction budget and the hard server limit were
+# the same number, so auto-compact fired with nothing left to run in — and
+# compaction is itself a request that must fit inside the window it is freeing.
+# Both the normal request and the /compact attempt were rejected:
+#   400 request (65873 tokens) exceeds the available context size (65536)
+#   400 request (66585 tokens) exceeds the available context size (65536)
+# There is no reactive fallback to catch this: Claude Code matches "prompt too
+# long" against Anthropic's error phrasing, and llama.cpp's wording does not
+# match, so it never recognises the overflow.
+#
+# 75% of per-slot. Leaves ~32k for the compaction request and its summary.
+# If you change -c or -np in aihost_models, change this to match.
+clients_auto_compact_window: 98304
 
 # Also drop copies into artifacts/ so they can be handed to the machines that
 # actually run Claude Code and Aider — this host is the server, not the client.

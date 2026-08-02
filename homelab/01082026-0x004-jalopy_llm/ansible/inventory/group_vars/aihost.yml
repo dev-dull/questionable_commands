@@ -104,10 +104,21 @@ aihost_models:
     # system prompt plus every tool definition on every turn and blows straight
     # through that ("request (32912 tokens) exceeds the available context size").
     # Measured on the box: -c 131072 uses 4922/8192 MiB VRAM, so this fits.
+    #
+    # -np 1, NOT 2 (changed 2026-08-02). Same -c, same VRAM, but the single slot
+    # gets the whole 131072 instead of half. 65536 per slot turned out to be
+    # unworkable for Claude Code: it is simultaneously the hard server ceiling
+    # AND the compaction budget, so auto-compact fires with no room left to run
+    # in, and /compact then fails too because compaction is itself a request
+    # that must fit in the window it is trying to free:
+    #   API Error: 400 request (65873 tokens) exceeds the available context size
+    #   Error during compaction: 400 request (66585 tokens) exceeds ...
+    # The cost is that two concurrent `coder` requests serialise. For two
+    # occasional users that is a far better trade than a model that deadlocks.
     args: >-
       -ngl 999 --n-cpu-moe 40 --load-mode none -fa on
       -c 131072 -ctk q8_0 -ctv q8_0
-      -t 10 -np 2 -b 4096 -ub 4096
+      -t 10 -np 1 -b 4096 -ub 4096
   scorer:
     hf_repo: unsloth/Qwen3.5-9B-GGUF
     quant: Q4_K_M                  # exists here; 5.2 GB
