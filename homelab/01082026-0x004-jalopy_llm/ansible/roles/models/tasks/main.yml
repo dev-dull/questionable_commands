@@ -1,0 +1,138 @@
+---
+# Phase 6 — Pre-warm the model cache
+
+- name: Refuse to pre-warm a model that cannot fit in RAM
+  # gpt-oss-120b is 61 GB against 64 GB of RAM with an OS in the way. The plan
+  # blocks it until the memory upgrade; this makes that a check, not a comment.
+  ansible.builtin.assert:
+    that:
+      - item.value.size_gb | int <= aihost_model_size_ceiling_gb | int
+    fail_msg: >-
+      Model '{{ item.key }}' is {{ item.value.size_gb }} GB, over the
+      {{ aihost_model_size_ceiling_gb }} GB ceiling for this box.
+      64 GB of RAM is the binding constraint — see LOCAL_AI_PLAN.md,
+      "What 64 GB actually costs you".
+    success_msg: "{{ item.key }}: {{ item.value.size_gb }} GB, fits"
+  loop: "{{ aihost_models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Warn about models too large to pin to one NUMA node
+  ansible.builtin.debug:
+    msg: >-
+      '{{ item.key }}' is {{ item.value.size_gb }} GB and numa_pinned is true,
+      but the smaller node has only {{ models_smaller_node_mb | int // 1024 }} GB.
+      It will straddle both sockets and lose the pinning benefit.
+  loop: "{{ aihost_models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  vars:
+    # The plan assumes a flat 32 GB per node; this box is asymmetric.
+    models_smaller_node_mb: 30148
+  when:
+    - item.value.numa_pinned | default(false) | bool
+    - (item.value.size_gb | int * 1024) > (models_smaller_node_mb | int * 0.92)
+
+- name: Check free space on the model pool
+  ansible.builtin.command: "df -B1 --output=avail {{ aihost_models_path }}"
+  changed_when: false
+  # Read-only, so run it under --check too. Otherwise stdout_lines is empty and
+  # the assertion below fails on an index error instead of telling you anything.
+  check_mode: false
+  register: models_df
+
+- name: Assert there is room for every model, at copies=2
+  ansible.builtin.assert:
+    that:
+      - (models_df.stdout_lines[1] | int) > (models_total_gb | int * 2 * 1073741824)
+    fail_msg: >-
+      Need ~{{ models_total_gb | int * 2 }} GB free (copies=2 doubles it) but
+      {{ (models_df.stdout_lines[1] | int) // 1073741824 }} GB is available.
+    success_msg: >-
+      {{ (models_df.stdout_lines[1] | int) // 1073741824 }} GB free;
+      need ~{{ models_total_gb | int * 2 }} GB for {{ aihost_models | length }} models at copies=2
+  vars:
+    models_total_gb: "{{ aihost_models.values() | map(attribute='size_gb') | map('int') | sum }}"
+
+- name: Install the pre-warm helper
+  ansible.builtin.template:
+    src: prewarm-model.sh.j2
+    dest: /usr/local/bin/prewarm-model.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Look for each model in the cache
+  # llama.cpp uses the HuggingFace hub cache layout, NOT flat .gguf files:
+  #   models--<user>--<repo>/blobs/<sha256>          <- content-addressed, no extension
+  #   models--<user>--<repo>/snapshots/<commit>/X.gguf  <- SYMLINK to the blob
+  # So the real filenames only exist as symlinks. file_type must be 'any' (the
+  # default 'file' misses them) and a size filter is meaningless here — it would
+  # measure the link, not the target. A partial download leaves an .incomplete
+  # blob and no snapshot symlink, so the symlink's presence is the right signal.
+  ansible.builtin.find:
+    paths: "{{ models_cache_dir }}/models--{{ item.value.hf_repo | replace('/', '--') }}/snapshots"
+    patterns: "*{{ item.value.quant }}*.gguf"
+    file_type: any
+    recurse: true
+  loop: "{{ aihost_models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: models_cache_probe
+
+- name: Summarise what still needs downloading
+  ansible.builtin.set_fact:
+    models_missing: >-
+      {{ models_cache_probe.results
+         | selectattr('matched', 'eq', 0)
+         | map(attribute='item.key') | list }}
+
+- name: Report the pre-warm plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('Already cached: ' ~ (aihost_models.keys() | difference(models_missing) | join(', ')))
+         if (aihost_models.keys() | difference(models_missing) | length) > 0
+         else 'Nothing cached yet.' }}
+      {{ ('To download: ' ~ (models_missing | join(', ')))
+         if models_missing | length > 0 else 'Nothing to download.' }}
+
+- name: Pre-warm each missing model
+  # Serialised on purpose: three concurrent multi-GB downloads onto a drive with
+  # 31k reallocated sectors is not a kindness.
+  become: true
+  become_user: "{{ aihost_user }}"
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/prewarm-model.sh
+      - "{{ aihost_models[item].hf_repo }}:{{ aihost_models[item].quant }}"
+      - "{{ models_prewarm_port }}"
+      - "{{ models_prewarm_timeout }}"
+  loop: "{{ models_missing if models_skip_if_cached else (aihost_models.keys() | list) }}"
+  changed_when: true
+  register: models_prewarm
+
+- name: Re-check the cache
+  ansible.builtin.find:
+    paths: "{{ models_cache_dir }}"
+    patterns: "*.gguf"
+    file_type: any
+    recurse: true
+  register: models_cache_final
+
+- name: Measure what the cache actually occupies
+  # Sizes come from the blobs, not the symlinks, so ask the filesystem.
+  ansible.builtin.command: "du -sb {{ models_cache_dir }}"
+  changed_when: false
+  check_mode: false
+  register: models_cache_du
+
+- name: Phase 6 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "Cache: {{ models_cache_dir }}"
+      - "Files: {{ models_cache_final.files | map(attribute='path') | map('basename') | sort | unique | join(', ') }}"
+      - "On-disk: {{ (models_cache_du.stdout.split()[0] | int) // 1073741824 }} GB
+         (roughly doubled on the pool by copies=2)"
+      - "Note: llama.cpp auto-fetches the mmproj for multimodal repos, so the
+         footprint exceeds the sum of the quant sizes."
+      - "gpt-oss-120b (61 GB) stays blocked until the memory upgrade."

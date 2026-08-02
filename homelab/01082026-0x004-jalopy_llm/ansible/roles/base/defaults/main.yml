@@ -1,0 +1,37 @@
+---
+# Run a full-upgrade on first convergence. Set false once the box is in service
+# and you would rather do kernel bumps by hand (see the ZFS warning below).
+base_full_upgrade: true
+
+base_packages:
+  # Toolchain for the llama.cpp build in Phase 5
+  - build-essential
+  - cmake
+  - git
+  # llama.cpp probes for OpenSSL at configure time and silently builds WITHOUT
+  # HTTPS if the dev files are missing. The build still succeeds and CUDA still
+  # links — but `-hf` cannot download anything, which breaks Phases 6 and 7
+  # entirely. Not optional.
+  - libssl-dev
+  # Runbook checkpoints parse JSON with jq and query PCI/DMI directly
+  - curl
+  - jq
+  - pciutils
+  - dmidecode
+  # NUMA pinning (Phase 7) and the memory-bandwidth baseline (Phase 2)
+  - numactl
+  - mbw
+  # Observability
+  - htop
+  - nvtop
+  - smartmontools
+  # Storage
+  - zfsutils-linux
+  # No-ops on engineering-sample CPUs, but leave it installed for the day
+  # retail chips go in. LOCAL_AI_PLAN.md, "Setup notes that follow".
+  - intel-microcode
+
+# Extra package globs unattended-upgrades must never touch. Leaving the kernel
+# out of this list is fine *because* Automatic-Reboot is false, but if you would
+# rather freeze it outright: ["linux-image-*", "linux-headers-*", "zfs-*"]
+base_unattended_blacklist: []

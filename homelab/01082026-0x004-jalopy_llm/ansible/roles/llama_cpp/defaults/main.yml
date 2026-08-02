@@ -1,0 +1,28 @@
+---
+llama_cpp_build_dir: "{{ aihost_llama_cpp_path }}/build"
+llama_cpp_bin_dir: "{{ aihost_llama_cpp_path }}/build/bin"
+
+# Written after a successful build so a re-run does not spend 20 minutes
+# recompiling an unchanged tree. Delete it to force a rebuild.
+llama_cpp_stamp: "{{ aihost_llama_cpp_path }}/.ansible-build-stamp"
+
+llama_cpp_cmake_options:
+  GGML_CUDA: "ON"
+  CMAKE_CUDA_ARCHITECTURES: "{{ aihost_cuda_arch }}"
+  GGML_NATIVE: "ON"
+  CMAKE_BUILD_TYPE: Release
+  # Nominally the default, but it degrades to a no-HTTPS build if libssl-dev is
+  # absent. Stating it explicitly makes the requirement greppable, and putting
+  # it in the build stamp means a change here forces a rebuild.
+  LLAMA_OPENSSL: "ON"
+
+# The Phase 5 checkpoint wants a llama-bench baseline, but there is no GGUF on
+# the box until Phase 6. Point this at a model file (or leave empty) — the
+# benchmark also runs standalone via `--tags bench`.
+llama_cpp_bench_model: ""
+llama_cpp_bench_ngl: 999
+# A bare -ngl 999 tries to put every layer in VRAM, which cannot work for a
+# 20 GB model on an 8 GB card. Benchmark with the SAME offload split the model
+# is actually served with, or the number means nothing.
+#   -e llama_cpp_bench_extra="--n-cpu-moe 40"
+llama_cpp_bench_extra: ""

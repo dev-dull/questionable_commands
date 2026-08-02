@@ -1,0 +1,179 @@
+---
+# Phase 7 — llama-swap (the front door)
+
+- name: Resolve the latest llama-swap release
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/mostlygeek/llama-swap/releases/latest
+    return_content: true
+  register: llama_swap_latest
+  when: llama_swap_version == "latest"
+  check_mode: false
+
+- name: Settle on a version
+  ansible.builtin.set_fact:
+    llama_swap_resolved: >-
+      {{ (llama_swap_latest.json.tag_name if llama_swap_version == 'latest'
+          else llama_swap_version) | trim }}
+
+- name: Check the installed version
+  ansible.builtin.command: "{{ llama_swap_bin }} --version"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  register: llama_swap_installed
+
+- name: Install the llama-swap binary
+  # Asset naming is llama-swap_<version-without-v>_linux_amd64.tar.gz, e.g. tag
+  # v245 -> llama-swap_245_linux_amd64.tar.gz. Verified against the release API.
+  ansible.builtin.unarchive:
+    src: >-
+      https://github.com/mostlygeek/llama-swap/releases/download/{{ llama_swap_resolved }}/llama-swap_{{
+      llama_swap_resolved | regex_replace('^v', '') }}_linux_amd64.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+    include: [llama-swap]
+    owner: root
+    group: root
+    mode: "0755"
+  when: llama_swap_resolved | regex_replace('^v', '') not in (llama_swap_installed.stdout | default(''))
+
+- name: Work out the usable context per request for each model
+  # -c is the total KV allocation and -np splits it, so the number that decides
+  # whether a request fits is c/np, not c. Getting this wrong is invisible in
+  # the config and only shows up as a 400 at request time.
+  ansible.builtin.set_fact:
+    llama_swap_ctx_check: >-
+      {{ llama_swap_ctx_check | default([]) + [{
+           'name': item.key,
+           'ctx': ctx_total,
+           'slots': slots,
+           'per_slot': (ctx_total | int) // ((slots | int) or 1),
+           'floor': floor,
+           'ok': ((ctx_total | int) // ((slots | int) or 1)) >= (floor | int),
+         }] }}
+  vars:
+    _toks: "{{ item.value.args.split() }}"
+    ctx_total: "{{ _toks[_toks.index('-c') + 1] if '-c' in _toks else 4096 }}"
+    slots: "{{ _toks[_toks.index('-np') + 1] if '-np' in _toks else 1 }}"
+    floor: "{{ item.value.min_ctx_per_slot | default(llama_swap_min_ctx_per_slot) }}"
+  loop: "{{ aihost_models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Report the per-request context budget
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.name }}: -c {{ item.ctx }} / -np {{ item.slots }}
+      = {{ item.per_slot }} usable per request (floor {{ item.floor }})
+      {{ 'OK' if item.ok else '<-- TOO SMALL' }}
+  loop: "{{ llama_swap_ctx_check }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Assert every model has enough context per request
+  ansible.builtin.assert:
+    that:
+      - llama_swap_ctx_check | rejectattr('ok') | list | length == 0
+    fail_msg: >-
+      Too little context per request on
+      {{ llama_swap_ctx_check | rejectattr('ok') | map(attribute='name') | join(', ') }}.
+      Remember -np DIVIDES -c: raise -c or lower -np. KV is cheap here —
+      -c 131072 measured at 4922/8192 MiB VRAM. Below its floor a model returns
+      "request (N tokens) exceeds the available context size" at request time,
+      which is invisible in the config.
+    success_msg: >-
+      Context per request:
+      {{ llama_swap_ctx_check | map(attribute='name')
+         | zip(llama_swap_ctx_check | map(attribute='per_slot'))
+         | map('join', '=') | join(', ') }}
+  when: llama_swap_min_ctx_per_slot | int > 0
+
+- name: Create the config directory
+  ansible.builtin.file:
+    path: "{{ llama_swap_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write the llama-swap config
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ llama_swap_config }}"
+    owner: root
+    group: root
+    mode: "0644"
+    # llama-swap has no config-check subcommand (its CLI is just -config,
+    # -config-dir, -listen, -tls-*, -version, -watch-config), so validate the
+    # YAML itself. That catches the realistic failure — a template that emits
+    # malformed YAML and leaves the service crash-looping — even though it
+    # cannot catch a semantically wrong but well-formed config.
+    validate: "python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' %s"
+  notify: Restart llama-swap
+
+- name: Note when NUMA pinning is unavailable
+  ansible.builtin.debug:
+    msg: >-
+      GPU NUMA node is {{ llama_swap_numa_node }}, so models marked numa_pinned
+      are being served WITHOUT --cpunodebind/--membind. Re-run Phase 3 to
+      rediscover, and check "Above 4G Decoding" in the BIOS.
+  when: llama_swap_numa_node | int < 0
+
+- name: Install the systemd unit
+  ansible.builtin.template:
+    src: llama-swap.service.j2
+    dest: /etc/systemd/system/llama-swap.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart llama-swap
+
+- name: Enable and start llama-swap
+  ansible.builtin.systemd_service:
+    name: llama-swap
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Flush handlers so the checkpoint tests the current config
+  ansible.builtin.meta: flush_handlers
+
+# --- Checkpoint: both dialects must answer -----------------------------------
+
+- name: Wait for the listener
+  ansible.builtin.wait_for:
+    port: "{{ aihost_llama_swap_port }}"
+    host: 127.0.0.1
+    timeout: 60
+
+- name: OpenAI dialect — list models
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ aihost_llama_swap_port }}/v1/models"
+    return_content: true
+  register: llama_swap_models_check
+
+- name: Assert every configured model is advertised
+  ansible.builtin.assert:
+    that:
+      - aihost_models.keys() | difference(llama_swap_models_check.json.data | map(attribute='id') | list) | length == 0
+    fail_msg: >-
+      Expected {{ aihost_models.keys() | list }}, got
+      {{ llama_swap_models_check.json.data | map(attribute='id') | list }}.
+    success_msg: "Serving: {{ llama_swap_models_check.json.data | map(attribute='id') | join(', ') }}"
+
+- name: Phase 7 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "llama-swap {{ llama_swap_resolved }} on {{ llama_swap_listen }}"
+      - "Models: {{ llama_swap_models_check.json.data | map(attribute='id') | join(', ') }}"
+      - "NUMA pinning: {{ 'node ' ~ llama_swap_numa_node if llama_swap_numa_node | int >= 0 else 'unavailable' }}"
+      - "Dialect probe runs under --tags dialects (it loads a model, so it is slow)."
+
+- name: Probe both API dialects
+  # `apply` is required: without it the included tasks inherit `never` from the
+  # include statement and are skipped even when --tags dialects is requested.
+  ansible.builtin.include_tasks:
+    file: check_dialects.yml
+    apply:
+      tags: [dialects]
+  tags: [dialects, never]

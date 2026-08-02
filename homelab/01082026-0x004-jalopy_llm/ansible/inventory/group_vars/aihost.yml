@@ -1,0 +1,156 @@
+---
+# =============================================================================
+# Homelab AI host — the whole tunable surface of HOST_SETUP.md in one file.
+# Anything you would have edited in the runbook, edit here instead.
+# =============================================================================
+
+# --- Identity -----------------------------------------------------------------
+# The unprivileged user that owns /srv/models, /opt/llama.cpp and runs llama-swap.
+#
+# This is the SSH login user, NOT ansible_user_id — the play runs with
+# become: true, so ansible_user_id resolves to "root" and every path this owns
+# would silently end up root-owned, including the llama-swap service user.
+aihost_user: "{{ ansible_user | default(ansible_facts.env.SUDO_USER) }}"
+
+# --- Safety gates -------------------------------------------------------------
+# Nothing that can destroy data runs unless you flip these deliberately, e.g.
+#   make apply TAGS=storage EXTRA="-e aihost_allow_disk_format=true"
+aihost_allow_disk_format: false     # mkfs on the spare 1 TB
+aihost_allow_zpool_create: false    # zpool create on the 8 TB
+aihost_allow_reboot: false          # driver install reboot in Phase 3
+
+# HOST_SETUP.md, "Read before touching the machine": the CPUs are engineering
+# samples and a BIOS/microcode change can leave the board unable to POST. This
+# playbook never touches firmware; the flag exists so the assertion is explicit
+# and greppable rather than a comment someone deletes.
+aihost_never_flash_bios: true
+
+# --- Expected hardware (Phase 2 asserts against these) ------------------------
+aihost_expect_numa_nodes: 2
+aihost_expect_dimms: 8              # 1 DIMM per channel: A1 B1 C1 D1 + E1 F1 G1 H1
+aihost_expect_mem_speed_mts: 2133
+aihost_expect_total_mem_gb: 64
+aihost_expect_gpu_match: "RTX 2080"
+aihost_expect_vram_mib: 8192
+# Fail the play on a hardware mismatch (true) or just warn loudly (false).
+aihost_hardware_asserts_fatal: true
+
+# --- Disks --------------------------------------------------------------------
+# MUST be /dev/disk/by-id/... paths — kernel names are not stable across reboots.
+# Find them with: ls -l /dev/disk/by-id/
+# Set these in inventory/host_vars/<host>.yml; left empty the storage role skips
+# and tells you what to fill in.
+aihost_tank_disk_by_id: ""          # the 8 TB (SMART errors — models only)
+aihost_evaldata_disk_by_id: ""      # the spare 1 TB (not re-downloadable data)
+
+aihost_zpool_name: tank
+aihost_zfs_dataset: "{{ aihost_zpool_name }}/models"
+aihost_models_path: /srv/models
+aihost_evaldata_path: /srv/evaldata
+aihost_evaldata_label: evaldata
+
+# ZED notification target for scrub/SMART events. Empty = leave zed.rc alone.
+aihost_zed_email: ""
+
+# --- Paths --------------------------------------------------------------------
+aihost_llama_cpp_path: /opt/llama.cpp
+aihost_llama_cache: "{{ aihost_models_path }}/llama"
+aihost_hf_home: "{{ aihost_models_path }}/hf"
+aihost_state_dir: /var/lib/homelab-aihost   # baselines recorded by Phase 2
+
+# --- llama.cpp build ----------------------------------------------------------
+aihost_llama_cpp_repo: https://github.com/ggml-org/llama.cpp
+# Pinned to the revision built and verified on clode 2026-08-02: CUDA linked,
+# CUDA0 device detected, GCC 15.2.0 host compiler against CUDA 12.4.
+# Set to "master" to track upstream — the role warns when you do, because an
+# unpinned ref means the next converge may not reproduce this build.
+aihost_llama_cpp_ref: 11924d4c17abc27383376a1ac6a24fa3e36c1c0c
+aihost_cuda_arch: "75"              # Turing only — cuts build time substantially
+aihost_build_jobs: 20               # 2x E5-2630 v4 = 20 physical cores
+
+# --- Models (Phase 6 pre-warm and Phase 7 serving both read this) -------------
+# 64 GB is the ceiling: budget ~50 GB per model, ~28 GB for anything NUMA-pinned.
+#
+# EVERY model pins an explicit `quant`. HOST_SETUP.md says `-hf user/repo`
+# defaults to Q4_K_M and that this is what we want — verified false against the
+# actual repos on 2026-08-02:
+#   * Qwen3.6-35B-A3B ships NO plain Q4_K_M. Only Unsloth-Dynamic UD-* variants.
+#   * gpt-oss-20b's repo also contains eagle3-* speculative-decoding draft
+#     models, which a default picker could plausibly choose instead.
+#
+# llama.cpp's own --help spells out why this matters:
+#   "quant is optional ... default to Q4_K_M, or FALLS BACK TO THE FIRST FILE
+#    IN THE REPO if Q4_K_M doesn't exist."
+# So a bare -hf on the 35B repo does not fail — it silently serves whatever
+# file happens to sort first, which could be an IQ1_M or a BF16 shard.
+#
+# Sizes are the real on-disk figures from the HF API, not estimates. Remember
+# tank/models is copies=2, so each one consumes twice this on the pool.
+aihost_models:
+  coder:
+    hf_repo: unsloth/Qwen3.6-35B-A3B-GGUF
+    quant: UD-Q4_K_M               # plan said Q4_K_M; that file does not exist
+    size_gb: 20
+    role: "Claude Code + Aider daily driver"
+    numa_pinned: true              # 20 GB fits the smaller (30148 MB) node
+    ttl: 3600
+    # Floor for usable context per request (-c / -np). Claude Code's system
+    # prompt + tool definitions alone run tens of thousands of tokens.
+    min_ctx_per_slot: 49152
+    # -c is the TOTAL KV allocation; -np divides it between slots. So
+    # `-c 131072 -np 2` is 65536 usable context per request, which is what
+    # LOCAL_AI_PLAN.md specifies. HOST_SETUP.md's `-c 65536 -np 2` halved it
+    # without touching -np, leaving 32768 per slot — Claude Code sends a large
+    # system prompt plus every tool definition on every turn and blows straight
+    # through that ("request (32912 tokens) exceeds the available context size").
+    # Measured on the box: -c 131072 uses 4922/8192 MiB VRAM, so this fits.
+    args: >-
+      -ngl 999 --n-cpu-moe 40 --load-mode none -fa on
+      -c 131072 -ctk q8_0 -ctv q8_0
+      -t 10 -np 2 -b 4096 -ub 4096
+  scorer:
+    hf_repo: unsloth/Qwen3.5-9B-GGUF
+    quant: Q4_K_M                  # exists here; 5.2 GB
+    size_gb: 6
+    role: "resume/JD fitness scoring — fits entirely in VRAM"
+    numa_pinned: false
+    ttl: 600
+    # -c 16384 / -np 8 = 2048 tokens per request. Fine for short scoring
+    # prompts, NOT enough for a full resume + job description + rubric in one
+    # call. Raise -c (or lower -np) if the eval harness sends whole documents.
+    min_ctx_per_slot: 2048
+    args: >-
+      -ngl 999 -fa on -c 16384 -np 8 --seed 42 --temp 0
+  small:
+    hf_repo: ggml-org/gpt-oss-20b-GGUF
+    # MXFP4 is the only real quant here and must never be re-quantized.
+    # Naming it explicitly also avoids the eagle3-* draft models in this repo.
+    quant: MXFP4
+    size_gb: 12
+    role: "fallback coder; easiest MoE-offload demo"
+    numa_pinned: false
+    ttl: 600
+    min_ctx_per_slot: 32768   # no -np, so the full -c is available per request
+    args: >-
+      -ngl 999 --n-cpu-moe 22 -fa on
+      -c 32768 -b 2048 -ub 2048 --temp 1.0 --top-p 1.0
+
+# Refuse to pre-warm anything that cannot fit (gpt-oss-120b is 61 GB).
+aihost_model_size_ceiling_gb: 50
+
+# --- Ports --------------------------------------------------------------------
+aihost_llama_swap_port: 8080
+aihost_webui_port: 3000
+aihost_lemonade_port: 13305
+
+# --- Network / firewall -------------------------------------------------------
+aihost_lan_subnet: 192.168.0.0/16
+aihost_lan_ip: "{{ ansible_facts.default_ipv4.address }}"
+# LAN-only. Nothing here is safe to expose to the internet.
+aihost_allowed_tcp_ports:
+  - 22
+  - "{{ aihost_llama_swap_port }}"
+  - "{{ aihost_webui_port }}"
+  # Lemonade's 13305 is deliberately NOT opened: Phase 9 is not implemented
+  # (see site.yml). Do not open ports for services that are not running.
+  # Add "{{ aihost_lemonade_port }}" here if you install it by hand.

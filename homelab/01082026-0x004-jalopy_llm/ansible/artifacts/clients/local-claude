@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Ansible managed
+# homelab/ansible/roles/clients
+#
+# Point Claude Code at the homelab box instead of Anthropic's API.
+#
+# This exists as a WRAPPER, not as shell-profile exports, so that plain `claude`
+# keeps talking to the real API. Exporting these globally means every future
+# session silently uses a 20 GB local model, which is a confusing way to spend
+# an afternoon.
+
+set -euo pipefail
+
+export ANTHROPIC_BASE_URL=http://192.168.1.223:8080
+export ANTHROPIC_AUTH_TOKEN=local
+
+# MUST be empty. A non-empty ANTHROPIC_API_KEY takes precedence and silently
+# sends your prompts to the real Anthropic API — billed, and off-LAN. Unsetting
+# is safer than setting it to "" because some versions treat empty and absent
+# differently.
+unset ANTHROPIC_API_KEY
+
+export ANTHROPIC_MODEL=coder
+export ANTHROPIC_SMALL_FAST_MODEL=coder
+
+# Fail loudly if the box is not reachable, rather than letting Claude Code fall
+# back to something unexpected.
+if ! curl -sf -m 5 "${ANTHROPIC_BASE_URL}/v1/models" >/dev/null; then
+    echo "local-claude: cannot reach ${ANTHROPIC_BASE_URL}" >&2
+    echo "  - is llama-swap up?   systemctl status llama-swap" >&2
+    echo "  - are you on the LAN? Phase 11 firewalls this to 192.168.0.0/16" >&2
+    exit 1
+fi
+
+exec claude "$@"

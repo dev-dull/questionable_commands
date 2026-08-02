@@ -1,0 +1,148 @@
+---
+# Phase 8 — Docker + Open WebUI
+
+- name: Install apt prerequisites
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, gnupg]
+    state: present
+
+- name: Create the apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install Docker's apt signing key
+  # The runbook pipes get.docker.com straight into a root shell. This does the
+  # same thing but is idempotent, auditable, and pins the key.
+  ansible.builtin.get_url:
+    url: "{{ docker_webui_apt_key_url }}"
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Check whether Docker publishes for this release
+  ansible.builtin.uri:
+    url: "{{ docker_webui_apt_repo_url }}/dists/{{ docker_webui_apt_suite }}/Release"
+    method: HEAD
+    status_code: [200, 403, 404]
+  register: docker_webui_suite_probe
+  check_mode: false
+
+- name: Choose an apt suite
+  # Docker lags new Ubuntu releases. 26.04 may have no repo of its own for a
+  # while; pointing at the previous LTS is the documented workaround and beats
+  # silently failing to install.
+  ansible.builtin.set_fact:
+    docker_webui_suite: >-
+      {{ docker_webui_apt_suite if docker_webui_suite_probe.status == 200 else docker_webui_apt_suite_fallback }}
+
+- name: Report the suite choice
+  ansible.builtin.debug:
+    msg: >-
+      Using Docker apt suite '{{ docker_webui_suite }}'
+      {{ '(no repo published for ' ~ docker_webui_apt_suite ~ ' yet)'
+         if docker_webui_suite != docker_webui_apt_suite else '' }}
+
+- name: Add the Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc]
+      {{ docker_webui_apt_repo_url }} {{ docker_webui_suite }} stable
+    filename: docker
+    state: present
+    update_cache: true
+
+- name: Install Docker
+  ansible.builtin.apt:
+    name: "{{ docker_webui_packages }}"
+    state: present
+
+- name: Install the Docker Python SDK
+  ansible.builtin.apt:
+    name: "{{ docker_webui_sdk_package }}"
+    state: present
+
+- name: Let the service user drive Docker without sudo
+  ansible.builtin.user:
+    name: "{{ aihost_user }}"
+    groups: docker
+    append: true
+
+- name: Ensure Docker is running
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+# --- Open WebUI ---------------------------------------------------------------
+
+- name: Warn about where the WebUI data lives
+  ansible.builtin.debug:
+    msg: >-
+      Open WebUI's volume '{{ docker_webui_volume }}' holds chat history, RAG documents
+      and user accounts — the only NON-re-downloadable data in this build. It
+      lives under /var/lib/docker on the boot SSD (healthy), not on tank/models
+      (31k reallocated sectors). Nothing here backs it up. Until a spare disk is
+      fitted, that is the gap.
+
+- name: Create the Open WebUI volume
+  community.docker.docker_volume:
+    name: "{{ docker_webui_volume }}"
+    state: present
+
+- name: Run Open WebUI
+  community.docker.docker_container:
+    name: "{{ docker_webui_container }}"
+    image: "{{ docker_webui_image }}"
+    state: started
+    restart_policy: unless-stopped
+    pull: true
+    ports:
+      # Bound to the LAN IP, not 0.0.0.0. Docker publishes ports by writing
+      # iptables rules that are evaluated BEFORE ufw, so Phase 11's rules do not
+      # filter this port at all. Binding to one interface is the cheap part of
+      # the mitigation; see the Phase 11 checkpoint for the rest.
+      - "{{ aihost_lan_ip }}:{{ aihost_webui_port }}:8080"
+    volumes:
+      - "{{ docker_webui_volume }}:/app/backend/data"
+    env:
+      # The host's LAN IP, never localhost — inside the container localhost is
+      # the container. For several backends the variable is the plural
+      # OPENAI_API_BASE_URLS, semicolon-separated.
+      OPENAI_API_BASE_URL: "http://{{ aihost_lan_ip }}:{{ aihost_llama_swap_port }}/v1"
+      OPENAI_API_KEY: local
+      WEBUI_AUTH: "{{ 'True' if docker_webui_auth_enabled else 'False' }}"
+  register: docker_webui_container_state
+
+- name: Wait for Open WebUI to answer
+  ansible.builtin.uri:
+    url: "http://{{ aihost_lan_ip }}:{{ aihost_webui_port }}/health"
+    status_code: [200]
+  register: docker_webui_health
+  retries: 30
+  delay: 5
+  until: docker_webui_health.status == 200
+
+- name: Check that Open WebUI can see the models
+  # Proves the container can actually reach llama-swap over the LAN IP, which is
+  # the single most likely thing to be misconfigured here.
+  ansible.builtin.uri:
+    url: "http://{{ aihost_lan_ip }}:{{ aihost_webui_port }}/api/models"
+    status_code: [200, 401]
+  register: docker_webui_models
+  failed_when: false
+
+- name: Phase 8 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "Open WebUI: http://{{ aihost_lan_ip }}:{{ aihost_webui_port }}"
+      - "Backend: http://{{ aihost_lan_ip }}:{{ aihost_llama_swap_port }}/v1"
+      - "Health: {{ docker_webui_health.status }}"
+      - "Model API: {{ docker_webui_models.status | default('n/a') }}
+         {{ '(401 = auth on, which is correct before you create the admin account)'
+            if docker_webui_models.status | default(0) == 401 else '' }}"
+      - "Create the admin account NOW — the first account to register becomes admin."

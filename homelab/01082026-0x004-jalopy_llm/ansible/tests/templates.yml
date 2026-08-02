@@ -1,0 +1,133 @@
+---
+# =============================================================================
+# Offline render tests for the llama-swap config template.
+#
+#   ansible-playbook tests/templates.yml
+#
+# The template branches on whether the GPU's NUMA node was discoverable. On the
+# real box it is always 0, so the "firmware reports no affinity" path would
+# never be exercised until the day the BIOS changes and it silently emits a
+# broken numactl invocation. Both branches are rendered and parsed here.
+# =============================================================================
+
+- name: Llama-swap config template
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    ansible_managed: "Ansible managed"
+    aihost_llama_cpp_path: /opt/llama.cpp
+    aihost_llama_cache: /srv/models/llama
+    aihost_hf_home: /srv/models/hf
+    aihost_user: alastair
+    llama_swap_health_timeout: 900
+    aihost_models:
+      coder:
+        hf_repo: unsloth/Qwen3.6-35B-A3B-GGUF
+        quant: UD-Q4_K_M
+        size_gb: 20
+        role: "daily driver"
+        numa_pinned: true
+        ttl: 3600
+        args: "-ngl 999 --n-cpu-moe 40 --load-mode none -fa on -c 65536"
+      scorer:
+        hf_repo: unsloth/Qwen3.5-9B-GGUF
+        quant: Q4_K_M
+        size_gb: 6
+        role: "scorer"
+        numa_pinned: false
+        ttl: 600
+        args: "-ngl 999 -fa on -c 16384"
+
+  tasks:
+    # --- GPU affinity known: pinned models get numactl ------------------------
+    - name: Render with a known NUMA node
+      ansible.builtin.set_fact:
+        t_pinned: "{{ lookup('template', '../roles/llama_swap/templates/config.yaml.j2') }}"
+      vars:
+        llama_swap_numa_node: 0
+
+    - name: Parse it
+      ansible.builtin.set_fact:
+        t_pinned_yaml: "{{ t_pinned | from_yaml }}"
+
+    - name: Pinned render is valid YAML with the expected shape
+      ansible.builtin.assert:
+        that:
+          - t_pinned_yaml.models | length == 2
+          - t_pinned_yaml.healthCheckTimeout | int == 900
+          # The pinned model gets numactl bound to the GPU's node...
+          - "'numactl --cpunodebind=0 --membind=0' in t_pinned_yaml.models.coder.cmd"
+          # ...and the unpinned one must not.
+          - "'numactl' not in t_pinned_yaml.models.scorer.cmd"
+          # Quants must be explicit — a bare repo would resolve to a default
+          # that does not exist for this model.
+          - "'-hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M' in t_pinned_yaml.models.coder.cmd"
+          - "'-hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M' in t_pinned_yaml.models.scorer.cmd"
+          # llama-swap substitutes ${PORT}; it must survive templating verbatim.
+          - "'${PORT}' in t_pinned_yaml.models.coder.cmd"
+          - t_pinned_yaml.models.coder.ttl | int == 3600
+        success_msg: "pinned: {{ t_pinned_yaml.models.coder.cmd | truncate(80) }}"
+        fail_msg: "unexpected render:\n{{ t_pinned }}"
+
+    # --- GPU affinity unknown: no numactl at all ------------------------------
+    - name: Render with no reported NUMA affinity
+      ansible.builtin.set_fact:
+        t_unpinned: "{{ lookup('template', '../roles/llama_swap/templates/config.yaml.j2') }}"
+      vars:
+        llama_swap_numa_node: -1
+
+    - name: Parse it
+      ansible.builtin.set_fact:
+        t_unpinned_yaml: "{{ t_unpinned | from_yaml }}"
+
+    - name: A -1 node must never emit numactl
+      # Regression guard: `numactl --cpunodebind=-1` is not a no-op, it is an
+      # error, and it would take the coder model down at swap time.
+      ansible.builtin.assert:
+        that:
+          - "'numactl' not in t_unpinned_yaml.models.coder.cmd"
+          - "'-1' not in t_unpinned_yaml.models.coder.cmd"
+          - t_unpinned_yaml.models | length == 2
+        success_msg: "unpinned render is clean"
+        fail_msg: "emitted numactl with an invalid node:\n{{ t_unpinned }}"
+
+    # --- Aider settings derive max_input_tokens from the serving args ---------
+    - name: Render the Aider model settings
+      ansible.builtin.set_fact:
+        t_aider: "{{ lookup('template', '../roles/clients/templates/aider.model.settings.yml.j2') }}"
+      vars:
+        clients_model: coder
+        clients_endpoint: http://192.168.1.223:8080
+
+    - name: Aider's context limit matches what llama-swap actually serves
+      # The coder args above carry "-c 65536". If someone changes the serving
+      # context and Aider keeps the old number, prompts get silently truncated
+      # server-side — which presents as the model ignoring your code.
+      ansible.builtin.assert:
+        that:
+          - (t_aider | from_yaml)[0].extra_params.max_input_tokens | int == 65536
+          - (t_aider | from_yaml)[0].name == "openai/coder"
+          - (t_aider | from_yaml)[0].edit_format == "diff"
+        success_msg: "aider max_input_tokens = {{ (t_aider | from_yaml)[0].extra_params.max_input_tokens }}"
+        fail_msg: "unexpected render:\n{{ t_aider }}"
+
+    - name: Aider's limit tracks a changed serving context
+      ansible.builtin.set_fact:
+        t_aider2: "{{ lookup('template', '../roles/clients/templates/aider.model.settings.yml.j2') }}"
+      vars:
+        clients_model: scorer         # its args carry "-c 16384"
+        clients_endpoint: http://192.168.1.223:8080
+
+    - name: A different model yields a different limit
+      ansible.builtin.assert:
+        that:
+          - (t_aider2 | from_yaml)[0].extra_params.max_input_tokens | int == 16384
+        success_msg: "scorer -> 16384, derivation follows the serving args"
+        fail_msg: "did not track the model's -c value:\n{{ t_aider2 }}"
+
+    - name: All template tests passed
+      ansible.builtin.debug:
+        msg: "6 assertions over 4 renders — NUMA branches and context derivation are sound."

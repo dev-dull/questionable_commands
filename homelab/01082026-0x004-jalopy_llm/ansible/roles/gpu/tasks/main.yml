@@ -1,0 +1,148 @@
+---
+# Phase 3 — GPU driver and CUDA
+
+- name: Probe for an already-working NVIDIA driver
+  # nounits gives "NVIDIA GeForce RTX 2080, 8192" — a bare integer we can
+  # compare without a regex. Backreferences do not survive assert's conditional
+  # templating, so parsing this with regex_search fails at runtime.
+  ansible.builtin.command: nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits
+  changed_when: false
+  failed_when: false
+  register: gpu_probe
+
+- name: Install the NVIDIA driver stack
+  # `install` is the correct verb on 26.04 — `autoinstall` is no longer listed.
+  # `install` also exists on 24.04, so this is the portable form.
+  ansible.builtin.command: ubuntu-drivers install
+  when: gpu_probe.rc != 0
+  register: gpu_driver_install
+  changed_when: gpu_driver_install.rc == 0
+
+- name: Reboot to load the new driver
+  ansible.builtin.reboot:
+    reboot_timeout: 900
+    post_reboot_delay: 15
+  when:
+    - gpu_driver_install is changed
+    - aihost_allow_reboot | bool
+
+- name: Stop and ask for a reboot
+  ansible.builtin.fail:
+    msg: >-
+      The NVIDIA driver was installed but this host needs a reboot before
+      nvidia-smi will work, and aihost_allow_reboot is false. Reboot the box,
+      then re-run with --tags phase3 (or pass -e aihost_allow_reboot=true).
+  when:
+    - gpu_driver_install is changed
+    - not (aihost_allow_reboot | bool)
+
+- name: Re-probe the GPU
+  # nounits gives "NVIDIA GeForce RTX 2080, 8192" — a bare integer we can
+  # compare without a regex. Backreferences do not survive assert's conditional
+  # templating, so parsing this with regex_search fails at runtime.
+  ansible.builtin.command: nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits
+  changed_when: false
+  register: gpu_smi
+
+- name: Split the GPU name and VRAM
+  ansible.builtin.set_fact:
+    gpu_name: "{{ (gpu_smi.stdout | split(','))[0] | trim }}"
+    gpu_vram_mib: "{{ (gpu_smi.stdout | split(','))[1] | trim | int }}"
+
+- name: Assert the expected card is present with the expected VRAM
+  ansible.builtin.assert:
+    that:
+      - aihost_expect_gpu_match in gpu_name
+      - gpu_vram_mib | int >= (aihost_expect_vram_mib | int * 0.95) | int
+    fail_msg: >-
+      Expected a {{ aihost_expect_gpu_match }} with ~{{ aihost_expect_vram_mib }} MiB,
+      got: {{ gpu_name }} / {{ gpu_vram_mib }} MiB.
+      VRAM decides the --n-cpu-moe tuning in Phase 7.
+    success_msg: "{{ gpu_name }}, {{ gpu_vram_mib }} MiB"
+  register: gpu_assert
+  failed_when:
+    - gpu_assert is failed
+    - aihost_hardware_asserts_fatal | bool
+
+- name: Install the CUDA toolkit
+  ansible.builtin.apt:
+    name: "{{ gpu_cuda_package }}"
+    state: present
+  when: gpu_cuda_package | length > 0
+
+- name: Read the CUDA compiler version
+  ansible.builtin.command: nvcc --version
+  changed_when: false
+  register: gpu_nvcc
+
+- name: Assert nvcc is usable
+  ansible.builtin.assert:
+    that:
+      - gpu_nvcc.rc == 0
+      - "'release' in gpu_nvcc.stdout"
+    fail_msg: >-
+      nvcc is not available. Phase 5 builds llama.cpp with -DGGML_CUDA=ON and
+      will fail without it.
+    success_msg: "{{ gpu_nvcc.stdout_lines | select('search', 'release') | first | trim }}"
+
+# --- NUMA affinity — needed by Phase 7 ---------------------------------------
+
+- name: Find the GPU's PCI address
+  ansible.builtin.shell:
+    cmd: set -o pipefail && lspci -D | grep -i 'VGA.*NVIDIA' | cut -d' ' -f1
+    executable: /bin/bash
+  changed_when: false
+  register: gpu_bdf
+
+- name: Read the NUMA node that owns the GPU
+  ansible.builtin.slurp:
+    src: "/sys/bus/pci/devices/{{ gpu_bdf.stdout | trim }}/numa_node"
+  register: gpu_numa_raw
+
+- name: Record the GPU NUMA node
+  ansible.builtin.set_fact:
+    gpu_numa_node: "{{ (gpu_numa_raw.content | b64decode | trim) | int }}"
+
+- name: Warn if the firmware does not report GPU NUMA affinity
+  ansible.builtin.debug:
+    msg: >-
+      numa_node is -1: the board is not reporting which socket owns the GPU.
+      Phase 7 will serve without --cpunodebind/--membind, losing the socket
+      pinning that makes the 22 GB coder model fast. Check that "Above 4G
+      Decoding" is enabled in the BIOS.
+  when: gpu_numa_node | int < 0
+
+- name: Ensure the local facts directory exists
+  ansible.builtin.file:
+    path: "{{ gpu_facts_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Persist the discovered topology as a local fact
+  # Phase 7 reads ansible_local.aihost.gpu_numa_node. Persisting it means a
+  # tagged run of just --tags phase7 still knows where to pin.
+  ansible.builtin.copy:
+    dest: "{{ gpu_facts_dir }}/aihost.fact"
+    content: |
+      {
+        "gpu_numa_node": {{ gpu_numa_node | int }},
+        "gpu_pci_address": "{{ gpu_bdf.stdout | trim }}",
+        "gpu_description": "{{ gpu_name }}, {{ gpu_vram_mib }} MiB"
+      }
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Re-gather local facts
+  ansible.builtin.setup:
+    filter: ansible_local
+
+- name: Phase 3 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "GPU: {{ gpu_name }}, {{ gpu_vram_mib }} MiB"
+      - "PCI: {{ gpu_bdf.stdout | trim }}"
+      - "NUMA node: {{ gpu_numa_node }}{{ ' (unreported — no pinning)' if gpu_numa_node | int < 0 else '' }}"
+      - "CUDA: {{ gpu_nvcc.stdout_lines | select('search', 'release') | first | trim }}"

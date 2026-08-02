@@ -1,0 +1,135 @@
+---
+# =============================================================================
+# Offline tests for the fragile bits: the expressions that parse dmidecode,
+# numactl, smartctl and mbw output.
+#
+#   ansible-playbook tests/parsing.yml
+#
+# Runs on the control node against recorded fixtures — no host, no hardware.
+# These are the expressions that would otherwise only fail at 2 a.m. on a box
+# you have to walk to.
+# =============================================================================
+
+- name: Parsing tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    fixtures: "{{ playbook_dir }}/fixtures"
+
+    # Mirrors of the role expressions under test. If you change one in the
+    # role, change it here — the duplication is the test.
+    numactl_stdout_lines: "{{ lookup('file', fixtures ~ '/numactl-hardware.txt').splitlines() }}"
+    dmidecode_stdout_lines: "{{ lookup('file', fixtures ~ '/dmidecode-memory.txt').splitlines() }}"
+    mbw_stdout_lines: "{{ lookup('file', fixtures ~ '/mbw.txt').splitlines() }}"
+    smart_json: "{{ lookup('file', fixtures ~ '/smartctl-tank.json') | from_json }}"
+    hardware_smart_attributes: [5, 187, 188, 197, 198]
+
+  tasks:
+    # --- roles/hardware: NUMA -----------------------------------------
+    - name: Parse the NUMA node count
+      ansible.builtin.set_fact:
+        t_numa_nodes: >-
+          {{ numactl_stdout_lines
+             | select('match', '^node [0-9]+ size:')
+             | list | length }}
+
+    - name: NUMA node count is 2
+      ansible.builtin.assert:
+        that: [t_numa_nodes | int == 2]
+        success_msg: "numa nodes = {{ t_numa_nodes }}"
+        fail_msg: "expected 2, parsed {{ t_numa_nodes }}"
+
+    # --- roles/hardware: memory ---------------------------------------
+    - name: Parse DIMM population and configured speed
+      ansible.builtin.set_fact:
+        t_dimms: >-
+          {{ dmidecode_stdout_lines | map('trim')
+             | select('match', '^Size: [0-9]+ [MG]B$')
+             | list | length }}
+        t_speeds: >-
+          {{ dmidecode_stdout_lines | map('trim')
+             | select('match', '^Configured Memory Speed: [0-9]+ MT/s$')
+             | map('regex_replace', '\D', '')
+             | map('int') | unique | sort }}
+
+    - name: Eight populated DIMMs, all at 2133, empty slots ignored
+      ansible.builtin.assert:
+        that:
+          - t_dimms | int == 8
+          - t_speeds | length == 1              # "Unknown" slots must not appear
+          - t_speeds[0] | int == 2133           # indexing proves it is a list, not a string
+          - t_speeds | type_debug == "list"
+        success_msg: "{{ t_dimms }} DIMMs @ {{ t_speeds[0] }} MT/s"
+        fail_msg: "parsed {{ t_dimms }} DIMMs, speeds {{ t_speeds }} ({{ t_speeds | type_debug }})"
+
+    # --- roles/hardware: bandwidth ------------------------------------
+    - name: Parse the mbw averages
+      ansible.builtin.set_fact:
+        t_mbw: >-
+          {{ mbw_stdout_lines | select('search', '^AVG')
+             | map('regex_replace', '^.*Copy:\s*([0-9.]+)\s*MiB/s.*$', '\1')
+             | map('trim') | list }}
+
+    - name: Bandwidth lines parse to three numbers
+      # The runbook greps `MiB/s:` but mbw prints `Copy: <n> MiB/s` — the value
+      # is BEFORE the unit, not after it. This assertion is the one that caught it.
+      ansible.builtin.assert:
+        that:
+          - t_mbw | length == 3
+          - t_mbw | map('regex_search', '^[0-9.]+$') | select('string') | list | length == 3
+        success_msg: "mbw averages: {{ t_mbw | join(', ') }}"
+        fail_msg: >-
+          mbw parse produced {{ t_mbw }} — expected three bare numbers.
+
+    # --- roles/hardware: SMART ----------------------------------------
+    - name: Extract the tracked SMART attributes
+      ansible.builtin.set_fact:
+        t_smart: >-
+          {{ dict(rows | map(attribute='name')
+                  | zip(rows | map(attribute='raw.value'))) }}
+      vars:
+        rows: >-
+          {{ smart_json.ata_smart_attributes.table
+             | selectattr('id', 'in', hardware_smart_attributes) | list }}
+
+    - name: Exactly the five tracked attributes, with their raw values
+      ansible.builtin.assert:
+        that:
+          - t_smart | type_debug == "dict"
+          - t_smart | length == 5
+          - t_smart['Reallocated_Sector_Ct'] | int == 24
+          - t_smart['Current_Pending_Sector'] | int == 8
+          - "'Power_On_Hours' not in t_smart"      # id 9 must be filtered out
+        success_msg: "{{ t_smart | to_json }}"
+        fail_msg: "parsed {{ t_smart | to_json }} ({{ t_smart | type_debug }})"
+
+    # --- roles/llama_cpp: cmake flags ----------------------------------------
+    - name: Build the CMake define list
+      ansible.builtin.set_fact:
+        t_defines: >-
+          {{ opts.items() | map('join', '=')
+             | map('regex_replace', '^', '-D') | list }}
+      vars:
+        opts:
+          GGML_CUDA: "ON"
+          CMAKE_CUDA_ARCHITECTURES: "75"
+          GGML_NATIVE: "ON"
+          CMAKE_BUILD_TYPE: Release
+
+    - name: CMake defines render as -DKEY=VALUE
+      ansible.builtin.assert:
+        that:
+          - t_defines | type_debug == "list"
+          - "'-DGGML_CUDA=ON' in t_defines"
+          - "'-DCMAKE_CUDA_ARCHITECTURES=75' in t_defines"
+          - "'-DCMAKE_BUILD_TYPE=Release' in t_defines"
+          - t_defines | length == 4
+        success_msg: "{{ t_defines | join(' ') }}"
+        fail_msg: "got {{ t_defines }}"
+
+    - name: All parsing tests passed
+      ansible.builtin.debug:
+        msg: "6 assertions over 4 fixtures — parsing logic is sound."

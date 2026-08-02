@@ -1,0 +1,13 @@
+# Installed collections — reproduced from requirements.yml
+.collections/
+
+# Fact cache; regenerate with `make facts`
+.facts_cache/
+
+# Baselines fetched off the host. Commit these deliberately — they are the
+# monthly SMART/bandwidth trend — but not the raw multi-MB SMART JSON.
+artifacts/**/*.json
+
+# Local inventory overrides
+inventory/hosts.local.yml
+*.retry

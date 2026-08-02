@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+# homelab/ansible/roles/clients
+#
+# Drop this in a repo as `.aider.model.settings.yml`, then:
+#   export OPENAI_API_BASE={{ clients_endpoint }}/v1
+#   export OPENAI_API_KEY=local
+#   aider --model openai/{{ clients_model }} --edit-format diff
+#
+# If you see repeated "SEARCH block not found", switch to --edit-format whole.
+# That failure means the model cannot reproduce existing code exactly enough for
+# a diff to apply — more likely on a Q4 quant than on a frontier model.
+
+{# Pull the context size straight out of the args llama-swap serves this model
+   with, so the two cannot drift. Token split rather than regex_search with a
+   backreference: that filter raises "Unknown argument" in this ansible-core
+   whenever it is used with capture-group arguments. #}
+{%- set _args = aihost_models[clients_model].args.split() %}
+{%- set _ctx = _args[_args.index('-c') + 1] | int if '-c' in _args else 65536 %}
+{%- set _np = _args[_args.index('-np') + 1] | int if '-np' in _args else 1 %}
+{%- set _per_slot = (_ctx // _np) if _np > 0 else _ctx %}
+- name: openai/{{ clients_model }}
+  edit_format: diff
+  use_repo_map: true
+  extra_params:
+    # USABLE CONTEXT PER SLOT, not -c. `-c` is the total KV allocation and `-np`
+    # divides it between server slots, so -c {{ _ctx }} -np {{ _np }} = {{ _per_slot }} per request.
+    # Setting this to -c on a multi-slot server sends prompts the server
+    # silently truncates. Same arithmetic as CLAUDE_CODE_AUTO_COMPACT_WINDOW.
+    max_input_tokens: {{ _per_slot }}

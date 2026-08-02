@@ -1,0 +1,19 @@
+# Ansible managed
+# homelab/ansible/roles/clients
+#
+# Drop this in a repo as `.aider.model.settings.yml`, then:
+#   export OPENAI_API_BASE=http://192.168.1.223:8080/v1
+#   export OPENAI_API_KEY=local
+#   aider --model openai/coder --edit-format diff
+#
+# If you see repeated "SEARCH block not found", switch to --edit-format whole.
+# That failure means the model cannot reproduce existing code exactly enough for
+# a diff to apply — more likely on a Q4 quant than on a frontier model.
+
+- name: openai/coder
+  edit_format: diff
+  use_repo_map: true
+  extra_params:
+    # Must not exceed the -c value llama-swap starts this model with, or you
+    # will send prompts the server silently truncates.
+    max_input_tokens: 131072

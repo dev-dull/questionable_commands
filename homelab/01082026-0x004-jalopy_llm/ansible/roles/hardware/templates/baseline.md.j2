@@ -1,0 +1,73 @@
+# Hardware baseline — {{ inventory_hostname }} — {{ aihost_now }}
+
+{{ ansible_managed }}
+
+Re-run `ansible-playbook site.yml --tags hardware` monthly and diff against this file.
+Trend matters more than the absolute numbers.
+
+## Platform
+
+| | |
+|---|---|
+| OS | {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }} |
+| Kernel | {{ ansible_facts.kernel }} |
+| CPU | {{ ansible_facts.processor_count }}x {{ ansible_facts.processor[2] | default('unknown') }} |
+| Cores / threads | {{ ansible_facts.processor_cores * ansible_facts.processor_count }} / {{ ansible_facts.processor_vcpus }} |
+| NUMA nodes | {{ hardware_numa_nodes }} |
+| Memory | {{ ansible_facts.memtotal_mb }} MB |
+
+## Memory
+
+- DIMMs populated: **{{ hardware_dimms_populated }}** (expected {{ aihost_expect_dimms }}, 1 per channel)
+- Configured speed: **{{ hardware_mem_speeds | join(', ') }} MT/s** (expected {{ aihost_expect_mem_speed_mts }})
+
+{% if hardware_mbw_avg is defined %}
+### Achieved bandwidth — `mbw -q -n {{ hardware_mbw_runs }} {{ hardware_mbw_size_mb }}`
+
+{% for line in hardware_mbw_avg %}
+- {{ line }} MiB/s
+{% endfor %}
+
+**This is single-threaded copy bandwidth — it is NOT the ~68 GB/s aggregate figure the plan's
+tok/s estimates use.** `mbw` runs one thread, and one Broadwell core cannot saturate four memory
+channels. Treat these numbers as a *regression check only*: useful for spotting "something got
+worse after a RAM change", useless as an absolute.
+
+To measure the aggregate bandwidth llama.cpp can actually pull with 20 threads, use Intel MLC
+(`mlc --max_bandwidth`, which spawns threads across cores) or STREAM built with OpenMP. Expect a
+number roughly an order of magnitude above the figures here.
+{% else %}
+### Achieved bandwidth
+
+Not measured this run (`hardware_run_mbw: false`).
+{% endif %}
+
+## NUMA topology
+
+```
+{{ hardware_numactl.stdout }}
+```
+
+## Block devices
+
+```
+{{ hardware_lsblk.stdout }}
+```
+
+{% if hardware_smart_tracked is defined %}
+## SMART — the 8 TB ({{ aihost_tank_disk_by_id }})
+
+This drive has known errors. Only re-downloadable data lives on it.
+
+| Attribute | Raw value |
+|---|---|
+{% for name, value in hardware_smart_tracked.items() %}
+| {{ name }} | {{ value }} |
+{% endfor %}
+
+Full `smartctl -j -a` output is in `smart-tank-{{ aihost_today }}.json` next to this file.
+{% else %}
+## SMART
+
+Not collected — `aihost_tank_disk_by_id` is unset. Fill it in in `inventory/host_vars/`.
+{% endif %}

@@ -1,0 +1,23 @@
+---
+# Where clients reach the box. Defaults to the LAN IP rather than the hostname:
+# the DNS name in HOST_SETUP.md (clode.deep13.lol) is a public-looking record on
+# a LAN-only service, and if it ever resolves off-LAN the ufw rules in Phase 11
+# mean clients break rather than leak — but an IP removes the ambiguity.
+clients_endpoint: "http://{{ aihost_lan_ip }}:{{ aihost_llama_swap_port }}"
+
+clients_bin_dir: "/home/{{ aihost_user }}/bin"
+clients_model: coder
+
+# Claude Code assumes 200,000 tokens for any model ID it doesn't recognise —
+# its context lookup fails for gateway aliases like `coder` and falls back to
+# that hardcoded default. Without this it won't auto-compact until ~167k, long
+# after llama.cpp has run out and started silently dropping the oldest tokens.
+#
+# This must equal USABLE CONTEXT PER SLOT, which is `-c` DIVIDED BY `-np`,
+# not `-c` itself:  coder runs -c 131072 -np 2  ->  65536 per request.
+# If you change either -c or -np in aihost_models, change this to match.
+clients_auto_compact_window: 65536
+
+# Also drop copies into artifacts/ so they can be handed to the machines that
+# actually run Claude Code and Aider — this host is the server, not the client.
+clients_fetch_to_artifacts: true

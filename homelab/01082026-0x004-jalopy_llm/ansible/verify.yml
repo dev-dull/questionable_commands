@@ -1,0 +1,171 @@
+---
+# =============================================================================
+# Post-install verification — the runbook's checklist, runnable on demand.
+#
+#   make verify
+#
+# Read-only. Safe to run against a live box any time; this is also the monthly
+# maintenance pass. Grows as later phases land.
+# =============================================================================
+
+- name: Verify the AI host
+  hosts: aihost
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Collect the state of the world
+      block:
+        - name: NUMA topology
+          ansible.builtin.command: numactl --hardware
+          changed_when: false
+          register: v_numa
+
+        - name: Configured memory speed
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail &&
+              dmidecode -t memory | grep -i 'configured memory speed' | sort -u
+            executable: /bin/bash
+          changed_when: false
+          register: v_mem
+
+        - name: GPU
+          ansible.builtin.command: nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+          changed_when: false
+          failed_when: false
+          register: v_gpu
+
+        - name: ZFS pool health
+          ansible.builtin.command: "zpool status -v {{ aihost_zpool_name }}"
+          changed_when: false
+          failed_when: false
+          register: v_zpool
+
+        - name: ZFS module provenance
+          ansible.builtin.shell:
+            cmd: set -o pipefail && modinfo zfs | grep -E '^(filename|version):'
+            executable: /bin/bash
+          changed_when: false
+          failed_when: false
+          register: v_zfsmod
+
+        - name: Check the llama.cpp build
+          ansible.builtin.stat:
+            path: "{{ aihost_llama_cpp_path }}/build/bin/llama-server"
+          register: v_llama
+
+        - name: Check llama-server capabilities
+          # CUDA and TLS are both silent-degradation failures: the binary builds
+          # and runs either way, and you only find out at inference time or at
+          # the first -hf download.
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail &&
+              ldd {{ aihost_llama_cpp_path }}/build/bin/llama-server
+              | grep -ciE 'libcud(a|art)|libssl' || true
+            executable: /bin/bash
+          changed_when: false
+          failed_when: false
+          register: v_llama_libs
+
+        - name: Check the model cache
+          ansible.builtin.find:
+            paths: "{{ aihost_llama_cache }}"
+            patterns: "*.gguf"
+            file_type: any
+            recurse: true
+          register: v_models
+
+        - name: Check the llama-swap service
+          ansible.builtin.systemd_service:
+            name: llama-swap
+          changed_when: false
+          failed_when: false
+          register: v_swap
+
+        - name: Ask llama-swap what it serves
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ aihost_llama_swap_port }}/v1/models"
+            return_content: true
+            timeout: 15
+          failed_when: false
+          register: v_swap_models
+
+        - name: Check Docker and Open WebUI
+          ansible.builtin.systemd_service:
+            name: docker
+          changed_when: false
+          failed_when: false
+          register: v_docker
+
+        - name: Check the Open WebUI endpoint
+          ansible.builtin.uri:
+            url: "http://{{ aihost_lan_ip }}:{{ aihost_webui_port }}/health"
+            timeout: 15
+          failed_when: false
+          register: v_webui
+
+        - name: Check the firewall
+          ansible.builtin.command: ufw status verbose
+          changed_when: false
+          failed_when: false
+          register: v_ufw
+
+        - name: Check the client wrapper
+          ansible.builtin.stat:
+            path: "/home/{{ aihost_user }}/bin/local-claude"
+          register: v_wrapper
+
+    - name: Assert the host still matches the plan
+      ansible.builtin.assert:
+        that:
+          - v_numa.stdout_lines | select('match', '^node [0-9]+ size:') | list | length
+            == aihost_expect_numa_nodes | int
+          - aihost_expect_mem_speed_mts | string in v_mem.stdout
+          - aihost_expect_gpu_match in v_gpu.stdout
+          - "'ONLINE' in v_zpool.stdout"
+          - "'DEGRADED' not in v_zpool.stdout"
+          - v_zfsmod.stdout is search('/lib/modules/')
+          - v_llama.stat.exists
+          # 3 = libcuda + libcudart + libssl. Anything less means a silently
+          # degraded build.
+          - v_llama_libs.stdout | int >= 3
+          - v_models.matched | int >= (aihost_models | length)
+          - v_swap.status.ActiveState == "active"
+          - aihost_models.keys() | difference(v_swap_models.json.data
+            | default([]) | map(attribute='id') | list) | length == 0
+          - v_docker.status.ActiveState == "active"
+          - v_webui.status == 200
+          - "'Status: active' in v_ufw.stdout"
+          - "'deny (incoming)' in v_ufw.stdout"
+          - v_wrapper.stat.exists
+        fail_msg: "Verification failed — see the report below."
+        success_msg: "All post-install checks passed."
+      ignore_errors: true    # noqa: ignore-errors  — always print the report
+      register: v_assert
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "NUMA nodes ....... {{ v_numa.stdout_lines | select('match', '^node [0-9]+ size:') | list | length }}"
+          - "Memory speed ..... {{ v_mem.stdout_lines | join(' / ') | trim }}"
+          - "GPU .............. {{ v_gpu.stdout | trim | default('not detected', true) }}"
+          - "ZFS module ....... {{ v_zfsmod.stdout_lines | join(' | ') }}"
+          - "Pool ............. {{ 'ONLINE' if 'ONLINE' in v_zpool.stdout else 'PROBLEM — see zpool status -v' }}"
+          - "llama.cpp ........ {{ 'built' if v_llama.stat.exists else 'MISSING' }}
+             (CUDA+TLS libs linked: {{ v_llama_libs.stdout | trim }}/3)"
+          - "Model cache ...... {{ v_models.matched }} GGUF files"
+          - "llama-swap ....... {{ v_swap.status.ActiveState | default('unknown') }}"
+          - "Serving .......... {{ v_swap_models.json.data | default([]) | map(attribute='id') | join(', ')
+                                   | default('nothing', true) }}"
+          - "Docker ........... {{ v_docker.status.ActiveState | default('unknown') }}"
+          - "Open WebUI ....... {{ 'healthy' if v_webui.status | default(0) == 200 else 'UNREACHABLE' }}
+             (http://{{ aihost_lan_ip }}:{{ aihost_webui_port }})"
+          - "Firewall ......... {{ 'active, default deny' if 'Status: active' in v_ufw.stdout else 'INACTIVE' }}"
+          - "Client wrapper ... {{ 'installed' if v_wrapper.stat.exists else 'MISSING' }}"
+
+    - name: Fail if any check failed
+      ansible.builtin.fail:
+        msg: "{{ v_assert.msg | default('verification failed') }}"
+      when: v_assert is failed

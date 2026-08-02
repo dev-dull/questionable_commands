@@ -1,0 +1,89 @@
+---
+# Phase 1 — Base system
+
+- name: Check whether the universe component is enabled
+  ansible.builtin.command: apt-cache policy
+  changed_when: false
+  register: base_apt_policy
+
+- name: Enable the universe component
+  # mbw lives in universe; without this the package install below fails with a
+  # bare "No package matching 'mbw'".
+  ansible.builtin.command: add-apt-repository -y universe
+  when: "'/universe' not in base_apt_policy.stdout"
+  register: base_universe_added
+  changed_when: base_universe_added.rc == 0
+
+- name: Update the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Full-upgrade the system
+  ansible.builtin.apt:
+    upgrade: full
+    autoremove: true
+  when: base_full_upgrade | bool
+  register: base_upgrade
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+- name: Install unattended-upgrades
+  ansible.builtin.apt:
+    name: unattended-upgrades
+    state: present
+
+# The runbook does this with `dpkg-reconfigure -plow`, which is interactive and
+# therefore not repeatable. These two files are what that dialog writes.
+- name: Enable periodic upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Restrict unattended-upgrades to security, and never reboot unattended
+  ansible.builtin.template:
+    src: 52homelab-unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/52homelab-unattended-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+# A malformed apt.conf fragment breaks every later apt call with a parse error
+# that does not name the file. Catch it here instead.
+- name: Verify the apt configuration still parses
+  ansible.builtin.command: apt-config dump
+  changed_when: false
+
+- name: Confirm Automatic-Reboot is off
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      apt-config dump | grep -i 'Unattended-Upgrade::Automatic-Reboot '
+    executable: /bin/bash
+  changed_when: false
+  register: base_autoreboot
+
+- name: Assert unattended-upgrades will not reboot the box on its own
+  ansible.builtin.assert:
+    that:
+      - "'\"false\"' in base_autoreboot.stdout"
+    fail_msg: >-
+      Automatic-Reboot is not false. A kernel bump that breaks the ZFS module
+      would take the model library offline unattended.
+    success_msg: "Automatic-Reboot is false"
+
+- name: Phase 1 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "Base packages installed ({{ base_packages | length }} packages)."
+      - "Unattended upgrades: security only, no automatic reboot."
+      - "{{ 'System was full-upgraded — reboot manually if the kernel changed.'
+            if (base_upgrade.changed | default(false)) else 'No upgrades applied.' }}"

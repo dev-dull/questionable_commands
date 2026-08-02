@@ -1,0 +1,18 @@
+---
+# Scratch port for the pre-warm server. Deliberately not the llama-swap port —
+# pre-warming must not collide with a running front door.
+models_prewarm_port: 8099
+
+# Per-model ceiling. 20 GB over a slow link is a long wait; the failure mode we
+# actually care about (bad spec, no disk, corrupt GGUF) shows up much earlier.
+models_prewarm_timeout: 5400
+
+# Where llama.cpp's -hf downloader puts things. Used for the idempotency check.
+models_cache_dir: "{{ aihost_llama_cache }}"
+
+# Skip a model whose GGUF is already cached at a plausible size. Set false to
+# force a re-check of every model (it will still not re-download).
+models_skip_if_cached: true
+
+# A cached file smaller than this is treated as a partial download.
+models_min_plausible_gb: 1

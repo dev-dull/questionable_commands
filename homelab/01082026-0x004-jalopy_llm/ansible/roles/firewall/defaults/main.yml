@@ -1,0 +1,12 @@
+---
+# Refuse to enable ufw unless the address this play arrived from is inside the
+# allowed subnet. Enabling a default-deny firewall over SSH with a rule that
+# does not cover you is the classic way to need physical access to a headless
+# box. Set false only if you have console access.
+firewall_require_ssh_covered: true
+
+firewall_enabled: true
+
+# Dead-man's switch: seconds after which ufw is automatically disabled unless
+# this play re-confirms connectivity. 0 disables the safety net.
+firewall_rollback_seconds: 300

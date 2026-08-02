@@ -1,0 +1,244 @@
+---
+# Phase 4 — Storage
+#
+# The destructive steps are behind aihost_allow_zpool_create /
+# aihost_allow_disk_format and additionally refuse to run against a disk that
+# is not blank. Read tasks/assert_blank.yml before overriding either.
+
+# --- ZFS module sanity --------------------------------------------------------
+
+- name: Read the loaded ZFS module info
+  ansible.builtin.command: modinfo zfs
+  changed_when: false
+  register: storage_modinfo
+
+- name: Assert ZFS is the prebuilt module, not a DKMS build
+  ansible.builtin.assert:
+    that:
+      - storage_modinfo.stdout is search('filename:\s+/lib/modules/')
+      - not (storage_modinfo.stdout is search('dkms'))
+    fail_msg: >-
+      zfs looks like a DKMS build. A failed rebuild after a kernel bump means
+      the pool holding the model library does not import. Ubuntu ships this
+      prebuilt and signed in linux-modules-extra — see LOCAL_AI_PLAN.md,
+      "Choosing the distribution".
+    success_msg: >-
+      {{ storage_modinfo.stdout_lines | select('match', '^(filename|version):') | join(' | ') }}
+
+# --- Model pool on the 8 TB ---------------------------------------------------
+
+- name: Check whether the pool already exists
+  ansible.builtin.command: "zpool list -H -o name {{ aihost_zpool_name }}"
+  changed_when: false
+  failed_when: false
+  register: storage_zpool_probe
+
+- name: Create the model pool
+  when: storage_zpool_probe.rc != 0
+  block:
+    - name: Require a stable by-id path for the 8 TB
+      ansible.builtin.assert:
+        that:
+          - aihost_tank_disk_by_id | length > 0
+          - aihost_tank_disk_by_id is match('/dev/disk/by-id/')
+        fail_msg: >-
+          Set aihost_tank_disk_by_id in inventory/host_vars/ to a
+          /dev/disk/by-id/... path. Never /dev/sdX — kernel device names are
+          not stable across reboots, and this command formats the disk.
+
+    - name: Confirm the target disk exists
+      ansible.builtin.stat:
+        path: "{{ aihost_tank_disk_by_id }}"
+        follow: true
+      register: storage_tank_stat
+
+    - name: Fail if the target disk is missing
+      ansible.builtin.assert:
+        that: [storage_tank_stat.stat.exists]
+        fail_msg: "{{ aihost_tank_disk_by_id }} does not exist. Re-check `ls -l /dev/disk/by-id/`."
+
+    - name: Confirm the 8 TB is blank
+      ansible.builtin.include_tasks: assert_blank.yml
+      vars:
+        blank_disk_path: "{{ aihost_tank_disk_by_id }}"
+        blank_disk_label: "8 TB model pool"
+
+    - name: Require explicit consent before creating the pool
+      ansible.builtin.assert:
+        that: [aihost_allow_zpool_create | bool]
+        fail_msg: >-
+          Pool '{{ aihost_zpool_name }}' does not exist and would be created on
+          {{ aihost_tank_disk_by_id }}, destroying its contents. Re-run with
+          -e aihost_allow_zpool_create=true once you have checked the by-id path.
+
+    - name: Create the pool
+      ansible.builtin.command:
+        argv:
+          - zpool
+          - create
+          - -o
+          - "ashift={{ storage_zpool_ashift }}"
+          - -O
+          - "compression={{ storage_zpool_compression }}"
+          - "{{ aihost_zpool_name }}"
+          - "{{ aihost_tank_disk_by_id }}"
+      changed_when: true
+
+- name: Create the models dataset
+  community.general.zfs:
+    name: "{{ aihost_zfs_dataset }}"
+    state: present
+    extra_zfs_properties:
+      copies: "{{ storage_models_copies }}"
+      recordsize: "{{ storage_models_recordsize }}"
+      mountpoint: "{{ aihost_models_path }}"
+
+- name: Hand the models tree to the service user
+  ansible.builtin.file:
+    path: "{{ aihost_models_path }}"
+    state: directory
+    owner: "{{ aihost_user }}"
+    group: "{{ aihost_user }}"
+    recurse: true
+
+# --- Scrub and notifications --------------------------------------------------
+
+- name: Enable the monthly scrub timer
+  ansible.builtin.systemd_service:
+    name: "{{ storage_scrub_timer }}"
+    enabled: true
+    state: started
+
+- name: Configure ZED notification target
+  ansible.builtin.lineinfile:
+    path: /etc/zfs/zed.d/zed.rc
+    regexp: '^#?\s*ZED_EMAIL_ADDR='
+    line: 'ZED_EMAIL_ADDR="{{ aihost_zed_email }}"'
+    backup: true
+  when: aihost_zed_email | length > 0
+  notify: Restart zed
+
+- name: Notify on successful scrubs too, not just faults
+  ansible.builtin.lineinfile:
+    path: /etc/zfs/zed.d/zed.rc
+    regexp: '^#?\s*ZED_NOTIFY_VERBOSE='
+    line: 'ZED_NOTIFY_VERBOSE={{ 1 if storage_zed_notify_verbose else 0 }}'
+  when: aihost_zed_email | length > 0
+  notify: Restart zed
+
+- name: Enable the ZFS event daemon
+  ansible.builtin.systemd_service:
+    name: zfs-zed
+    enabled: true
+    state: started
+
+# --- Spare 1 TB for anything not re-downloadable -------------------------------
+
+- name: Provision the eval-data disk
+  when: aihost_evaldata_disk_by_id | length > 0
+  block:
+    - name: Check whether the eval-data disk is already provisioned
+      ansible.builtin.command: "lsblk -no FSTYPE,LABEL {{ aihost_evaldata_disk_by_id }}"
+      changed_when: false
+      register: storage_evaldata_probe
+
+    - name: Note whether this disk is already ours
+      # Without this, the blank-disk guard below would fire on every run after
+      # the first — it would be looking at the filesystem we ourselves created.
+      ansible.builtin.set_fact:
+        storage_evaldata_provisioned: >-
+          {{ 'ext4' in storage_evaldata_probe.stdout
+             and aihost_evaldata_label in storage_evaldata_probe.stdout }}
+
+    - name: Confirm the eval-data disk is blank
+      ansible.builtin.include_tasks: assert_blank.yml
+      vars:
+        blank_disk_path: "{{ aihost_evaldata_disk_by_id }}"
+        blank_disk_label: "1 TB eval data"
+      when: not storage_evaldata_provisioned
+
+    - name: Require explicit consent before formatting
+      ansible.builtin.assert:
+        that: [aihost_allow_disk_format | bool]
+        fail_msg: >-
+          {{ aihost_evaldata_disk_by_id }} has no filesystem and would be
+          formatted ext4. Re-run with -e aihost_allow_disk_format=true.
+      when: not storage_evaldata_provisioned
+
+    - name: Create the ext4 filesystem
+      community.general.filesystem:
+        dev: "{{ aihost_evaldata_disk_by_id }}"
+        fstype: ext4
+        opts: "-L {{ aihost_evaldata_label }}"
+        # Never reformat a disk that already has a filesystem.
+        force: false
+
+    - name: Mount it by label
+      ansible.posix.mount:
+        path: "{{ aihost_evaldata_path }}"
+        src: "LABEL={{ aihost_evaldata_label }}"
+        fstype: ext4
+        opts: defaults
+        passno: "2"
+        state: mounted
+
+    - name: Hand the eval-data tree to the service user
+      ansible.builtin.file:
+        path: "{{ aihost_evaldata_path }}"
+        state: directory
+        owner: "{{ aihost_user }}"
+        group: "{{ aihost_user }}"
+        mode: "0755"
+
+- name: Note that eval data has nowhere to live
+  ansible.builtin.debug:
+    msg: >-
+      aihost_evaldata_disk_by_id is unset, so {{ aihost_evaldata_path }} was not
+      provisioned. Anything not re-downloadable must not live on the 8 TB.
+  when: aihost_evaldata_disk_by_id | length == 0
+
+# --- Model cache location -----------------------------------------------------
+
+- name: Point the model caches at the pool
+  ansible.builtin.template:
+    src: aihost.sh.j2
+    dest: /etc/profile.d/aihost.sh
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Create the cache directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ aihost_user }}"
+    group: "{{ aihost_user }}"
+    mode: "0755"
+  loop:
+    - "{{ aihost_llama_cache }}"
+    - "{{ aihost_hf_home }}"
+
+# --- Checkpoint ---------------------------------------------------------------
+
+- name: Read pool status
+  ansible.builtin.command: "zpool status {{ aihost_zpool_name }}"
+  changed_when: false
+  register: storage_status
+
+- name: Assert the pool is healthy
+  ansible.builtin.assert:
+    that:
+      - "'ONLINE' in storage_status.stdout"
+      - "'DEGRADED' not in storage_status.stdout"
+      - "'FAULTED' not in storage_status.stdout"
+    fail_msg: "Pool is not healthy:\n{{ storage_status.stdout }}"
+    success_msg: "{{ aihost_zpool_name }} ONLINE"
+
+- name: Phase 4 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "{{ aihost_zfs_dataset }} -> {{ aihost_models_path }} (copies={{ storage_models_copies }})"
+      - "LLAMA_CACHE={{ aihost_llama_cache }}"
+      - "HF_HOME={{ aihost_hf_home }}  (separate cache — see Phase 6)"
+      - "Monthly scrub timer: {{ storage_scrub_timer }}"
+      - "After every kernel update, run `zpool status` before walking away."
