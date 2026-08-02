@@ -1,6 +1,6 @@
 # Point Claude Code at the homelab box.  Usage:  source claude-local.sh
 
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=65536   # must match llama-server's -c
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=49152 # Set to 75% of actual headroom to avoid /compact deadlock
 export ANTHROPIC_BASE_URL=http://192.168.1.223:8080
 export ANTHROPIC_AUTH_TOKEN=local
 export ANTHROPIC_MODEL=coder
