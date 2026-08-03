@@ -483,7 +483,8 @@ aider --model openai/coder --edit-format diff
   edit_format: diff
   use_repo_map: true
   extra_params:
-    max_input_tokens: 65536
+    # Usable context PER SLOT: -c divided by -np. coder is -c 131072 -np 1.
+    max_input_tokens: 131072
 ```
 
 If you see repeated "SEARCH block not found", switch to `--edit-format whole`.

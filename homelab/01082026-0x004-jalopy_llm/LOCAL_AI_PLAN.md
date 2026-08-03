@@ -423,26 +423,47 @@ Code still works.
 ### Telling Claude Code the real context size — you must, and there's exactly one knob
 
 **Claude Code assumes 200,000 tokens for any model it doesn't recognize.** Its context-window
-lookup fails for gateway model IDs and falls back to that hardcoded default. Your `coder` server
-gives each request 65536 (`-c 131072` split across `-np 2`).
+lookup fails for gateway model IDs and falls back to that hardcoded default. `coder` gives each
+request **131072** (`-c 131072` with `-np 1`).
 
 That mismatch is a live bug, not a rounding error. Auto-compaction fires at roughly 83.5% of what
-Claude Code *believes* the window is — about 167k tokens — but llama.cpp hits its wall at 65,536.
+Claude Code *believes* the window is — about 167k tokens — but llama.cpp hits its wall long before.
 You get a hard error, or worse, llama.cpp silently context-shifts and drops the oldest tokens.
 The conversation quietly loses its beginning and nobody is told.
 
 **The fix is one variable:**
 
 ```bash
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=65536     # = -c divided by -np, NOT -c
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=98304     # 75% of per-slot, NOT the ceiling
 ```
 
-⚠️ **The value is usable context *per slot*, not the `-c` figure.** `-c` is the total KV
-allocation and `-np` divides it between server slots, so `coder`'s `-c 131072 -np 2` yields
-**65536 per request**. Setting this to `-c` on a multi-slot server would put you right back where
-you started. Measured consequence of getting it wrong the other way — `-c 65536 -np 2`, only 32768
-per slot — is a hard failure on the very first turn:
+Two rules, and the second one cost an afternoon to learn:
+
+**1. The budget is usable context *per slot*, not `-c`.** `-c` is the total KV allocation and `-np`
+divides it between server slots. Get this backwards and you fail on the first turn:
+`-c 65536 -np 2` leaves only 32768 per slot →
 `request (32912 tokens) exceeds the available context size`.
+
+**2. ⚠️ It must sit *below* the per-slot ceiling, not equal to it.** Setting the compaction budget
+to exactly the hard limit deadlocks: compaction fires with no room left to run in, and `/compact`
+is itself a request that has to fit inside the window it's trying to free.
+
+```
+API Error: 400 request (65873 tokens) exceeds the available context size (65536 tokens)
+Error during compaction: 400 request (66585 tokens) exceeds the available context size (65536)
+```
+
+**Nothing recovers from this on its own.** Claude Code's reactive compaction matches "prompt too
+long" against Anthropic's error wording, and llama.cpp's phrasing isn't in that set — so the
+overflow is never recognised as one. The proactive threshold is the only protection there is.
+
+Hence `-np 1` for `coder`: same `-c`, same VRAM, but the single slot gets all 131072 rather than
+half, and the window is set to **75% of that (98304)** to leave compaction somewhere to work. The
+cost is that concurrent `coder` requests serialise — a fair trade for two occasional users.
+
+> **Gotcha that made this hard to diagnose:** `local-claude` *exports* these values, so they
+> override anything you set in your shell beforehand. Testing a different window by exporting it
+> and then running the wrapper silently does nothing.
 
 Documented as: *"Set the context capacity in tokens used for auto-compaction calculations. Defaults
 to the model's context window, 200K for standard models… The value is capped at the model's actual
@@ -450,8 +471,8 @@ context window."* Since Claude Code thinks the window is 200K, a lower value app
 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is then a percentage *of this value*, so the default ~83.5% puts
 compaction around 54k and leaves ~11k of headroom for the response.
 
-**Keep this number and `-c` in sync.** If you raise the server's context after fitting more VRAM,
-raise this too — and vice versa. It's the single most likely thing to drift out of alignment in
+**Keep this number, `-c`, and `-np` in sync.** If you change the server's context or slot count,
+recompute: window = 75% of (`-c` / `-np`). It's the single most likely thing to drift out of alignment in
 the whole setup.
 
 > **Gateway model discovery does not solve this**, though it looks like it should.
