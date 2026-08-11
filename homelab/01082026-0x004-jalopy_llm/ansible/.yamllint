@@ -1,0 +1,25 @@
+---
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1
+  # These two are required to match ansible-lint's own yaml rule; diverging
+  # makes it disable fix mode.
+  comments-indentation: false
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+
+ignore: |
+  .collections/
+  .facts_cache/
+  artifacts/

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# homelab/ansible/roles/models — do not edit on the host.
+#
+# Pre-warm one model into LLAMA_CACHE.
+#
+# HOST_SETUP.md Phase 6 says "run each of these once and Ctrl-C after the model
+# finishes loading". That is not scriptable, so this does the same thing
+# deterministically: start llama-server, wait until /health reports it has the
+# weights resident, then stop it. Exit 0 means the model downloaded AND loaded —
+# which is a stronger guarantee than "the bytes arrived", because a truncated or
+# corrupt GGUF fails at load, not at download.
+#
+# Usage: prewarm-model.sh <hf-spec> <port> <timeout-seconds>
+
+set -euo pipefail
+
+SPEC="${1:?usage: prewarm-model.sh <hf-spec> <port> <timeout>}"
+PORT="${2:?}"
+TIMEOUT="${3:-3600}"
+
+SERVER={{ aihost_llama_cpp_path }}/build/bin/llama-server
+export LLAMA_CACHE={{ aihost_llama_cache }}
+export HF_HOME={{ aihost_hf_home }}
+
+log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# -ngl 0 keeps this off the GPU: we only want the weights on disk and proven
+# loadable. Pulling 20 GB through 8 GB of VRAM would just add failure modes.
+log "starting llama-server for ${SPEC}"
+"$SERVER" -hf "$SPEC" --port "$PORT" --host 127.0.0.1 -ngl 0 -c 512 \
+    >/tmp/prewarm-${PORT}.log 2>&1 &
+SERVER_PID=$!
+
+cleanup() {
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+        log "stopping llama-server (pid ${SERVER_PID})"
+        kill "$SERVER_PID" 2>/dev/null || true
+        for _ in $(seq 1 30); do
+            kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+    fi
+    wait "$SERVER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+DEADLINE=$(( $(date +%s) + TIMEOUT ))
+while :; do
+    # If the server died, the download or the load failed. Surface its log
+    # rather than sitting here until the timeout expires.
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        log "llama-server exited before becoming healthy; last 40 lines:"
+        tail -40 "/tmp/prewarm-${PORT}.log" >&2 || true
+        exit 1
+    fi
+
+    if curl -sf -m 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+        log "healthy — ${SPEC} is cached and loads cleanly"
+        exit 0
+    fi
+
+    if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        log "timed out after ${TIMEOUT}s waiting for ${SPEC}; last 40 lines:"
+        tail -40 "/tmp/prewarm-${PORT}.log" >&2 || true
+        exit 1
+    fi
+    sleep 5
+done

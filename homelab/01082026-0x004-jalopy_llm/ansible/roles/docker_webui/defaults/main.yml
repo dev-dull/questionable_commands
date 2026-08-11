@@ -1,0 +1,34 @@
+---
+# Docker from Docker's own apt repo — NOT the snap, whose confinement breaks
+# bind mounts and GPU access, and NOT `curl | sh`, which is neither idempotent
+# nor auditable.
+docker_webui_apt_key_url: https://download.docker.com/linux/ubuntu/gpg
+docker_webui_apt_repo_url: https://download.docker.com/linux/ubuntu
+docker_webui_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+# The community.docker modules need the Python SDK on the target.
+docker_webui_sdk_package: python3-docker
+
+# 26.04 ("resolute") may not have a Docker repo suite yet; fall back to the
+# newest release Docker actually publishes for.
+docker_webui_apt_suite: "{{ ansible_facts.distribution_release }}"
+docker_webui_apt_suite_fallback: noble
+
+docker_webui_image: ghcr.io/open-webui/open-webui:main
+docker_webui_container: open-webui
+docker_webui_volume: open-webui
+
+# IMPORTANT: this volume holds chat history, RAG documents and user accounts —
+# the only data in this build that is NOT re-downloadable. It deliberately lives
+# on Docker's default root (/var/lib/docker, the 120 GB boot SSD) rather than on
+# tank/models, because the 8 TB has 31k reallocated sectors and the plan says
+# only re-downloadable data goes there. Back it up off-box; nothing here does.
+docker_webui_volume_on_pool: false
+
+# Auth. Open WebUI's first account becomes the admin, so an unsecured instance
+# on the LAN is a land-grab waiting to happen. Create yours immediately.
+docker_webui_auth_enabled: true

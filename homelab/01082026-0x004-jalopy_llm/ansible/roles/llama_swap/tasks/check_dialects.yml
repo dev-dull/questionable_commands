@@ -1,0 +1,119 @@
+---
+# Phase 7 checkpoint — both dialects must answer.
+#
+# Separate from main.yml because this genuinely loads a model: the first request
+# starts llama-server and waits for weights. Run it with:
+#   make apply TAGS=dialects
+#
+# Uses the smallest configured model so the check costs seconds, not minutes.
+
+- name: Pick the cheapest model to probe with
+  ansible.builtin.set_fact:
+    llama_swap_dialect_model: >-
+      {{ (aihost_models | dict2items | sort(attribute='value.size_gb') | first).key }}
+
+- name: Announce the probe
+  ansible.builtin.debug:
+    msg: >-
+      Probing with '{{ llama_swap_dialect_model }}'. The first request has to start
+      llama-server and load weights, so allow up to
+      {{ llama_swap_health_timeout }}s.
+
+# --- OpenAI dialect -----------------------------------------------------------
+
+- name: OpenAI dialect — chat completion
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ aihost_llama_swap_port }}/v1/chat/completions"
+    method: POST
+    body_format: json
+    body:
+      model: "{{ llama_swap_dialect_model }}"
+      # Qwen3.5 is a REASONING model: it emits a thinking block into
+      # `reasoning_content` before it writes a single token of `content`. With a
+      # small budget it hits finish_reason=length mid-thought and returns an
+      # empty `content` — which looks exactly like a broken endpoint but is not.
+      max_tokens: 512
+      messages:
+        - role: user
+          content: "Reply with exactly: OK"
+    timeout: "{{ llama_swap_health_timeout }}"
+    return_content: true
+  register: llama_swap_dialect_openai
+
+- name: Assert the OpenAI dialect returned a completion
+  # This checks the TRANSPORT, not the model's obedience. Either field carrying
+  # text proves llama-swap routed the request, started the server, and streamed
+  # tokens back in the OpenAI shape.
+  ansible.builtin.assert:
+    that:
+      - llama_swap_dialect_openai.json.choices | length > 0
+      - (llama_swap_dialect_openai.json.choices[0].message.content | default('') | length > 0)
+        or (llama_swap_dialect_openai.json.choices[0].message.reasoning_content | default('') | length > 0)
+    fail_msg: "No completion from /v1/chat/completions: {{ llama_swap_dialect_openai.json | default('') }}"
+    success_msg: >-
+      /v1/chat/completions -> {{ llama_swap_dialect_openai.json.usage.completion_tokens }} tokens
+      @ {{ llama_swap_dialect_openai.json.timings.predicted_per_second | default(0) | round(1) }} tok/s
+      (finish: {{ llama_swap_dialect_openai.json.choices[0].finish_reason }})
+
+# --- Anthropic dialect — this is what Claude Code speaks -----------------------
+
+- name: Anthropic dialect — messages
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ aihost_llama_swap_port }}/v1/messages"
+    method: POST
+    body_format: json
+    body:
+      model: "{{ llama_swap_dialect_model }}"
+      max_tokens: 512          # same reasoning-model budget as above
+      messages:
+        - role: user
+          content: "Reply with exactly: OK"
+    timeout: "{{ llama_swap_health_timeout }}"
+    return_content: true
+  register: llama_swap_dialect_anthropic
+
+- name: Assert the Anthropic dialect returned content
+  ansible.builtin.assert:
+    that:
+      - llama_swap_dialect_anthropic.json.content | length > 0
+      - llama_swap_dialect_anthropic.json.content | map(attribute='type') | list | length > 0
+    fail_msg: >-
+      No content from /v1/messages: {{ llama_swap_dialect_anthropic.json | default('') }}.
+      Claude Code depends on this endpoint — without it the whole use case is
+      a translation proxy away.
+    success_msg: >-
+      /v1/messages -> blocks: {{ llama_swap_dialect_anthropic.json.content | map(attribute='type') | join(', ') }},
+      stop_reason: {{ llama_swap_dialect_anthropic.json.stop_reason | default('?') }}
+
+- name: Anthropic dialect — token counting
+  # Claude Code calls this before every request; a 404 here breaks it even
+  # though /v1/messages works.
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ aihost_llama_swap_port }}/v1/messages/count_tokens"
+    method: POST
+    body_format: json
+    body:
+      model: "{{ llama_swap_dialect_model }}"
+      messages:
+        - role: user
+          content: "count these tokens"
+    timeout: 60
+    return_content: true
+    status_code: [200, 404]
+  register: llama_swap_dialect_count
+
+- name: Report token-counting support
+  ansible.builtin.debug:
+    msg: >-
+      {{ '/v1/messages/count_tokens -> ' ~ (llama_swap_dialect_count.json.input_tokens | default('?')) ~ ' tokens'
+         if llama_swap_dialect_count.status == 200
+         else '/v1/messages/count_tokens returned 404. Claude Code calls this
+               endpoint; if it is genuinely absent, expect breakage.' }}
+
+- name: Dialect checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "Probed model .............. {{ llama_swap_dialect_model }}"
+      - "OpenAI /v1/chat/completions ... OK"
+      - "Anthropic /v1/messages ....... OK"
+      - "count_tokens ................. {{ 'OK' if llama_swap_dialect_count.status == 200 else 'ABSENT (404)' }}"

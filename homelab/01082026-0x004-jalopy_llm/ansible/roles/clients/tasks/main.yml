@@ -1,0 +1,62 @@
+---
+# Phase 10 — Client configuration
+#
+# These are CLIENT artifacts: the machines running Claude Code and Aider are not
+# this box. They are generated here so they stay in sync with the serving config
+# (ports, model names, context sizes), installed on the host for testing over
+# SSH, and fetched into artifacts/ for copying to the real client machines.
+
+- name: Assert the requested model is actually served
+  ansible.builtin.assert:
+    that:
+      - clients_model in aihost_models
+    fail_msg: >-
+      clients_model is '{{ clients_model }}' but llama-swap only serves
+      {{ aihost_models.keys() | list }}.
+    success_msg: "Clients will target '{{ clients_model }}'"
+
+- name: Create the user bin directory
+  ansible.builtin.file:
+    path: "{{ clients_bin_dir }}"
+    state: directory
+    owner: "{{ aihost_user }}"
+    group: "{{ aihost_user }}"
+    mode: "0755"
+
+- name: Install the local-claude wrapper
+  ansible.builtin.template:
+    src: local-claude.j2
+    dest: "{{ clients_bin_dir }}/local-claude"
+    owner: "{{ aihost_user }}"
+    group: "{{ aihost_user }}"
+    mode: "0755"
+    validate: "bash -n %s"
+
+- name: Generate the Aider model settings
+  ansible.builtin.template:
+    src: aider.model.settings.yml.j2
+    dest: "{{ clients_bin_dir }}/aider.model.settings.yml"
+    owner: "{{ aihost_user }}"
+    group: "{{ aihost_user }}"
+    mode: "0644"
+
+- name: Fetch the client artifacts to the control node
+  ansible.builtin.fetch:
+    src: "{{ clients_bin_dir }}/{{ item }}"
+    dest: "artifacts/clients/{{ item }}"
+    flat: true
+  loop:
+    - local-claude
+    - aider.model.settings.yml
+  when: clients_fetch_to_artifacts | bool
+
+- name: Phase 10 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "Endpoint ....... {{ clients_endpoint }}"
+      - "Model .......... {{ clients_model }}"
+      - "Wrapper ........ {{ clients_bin_dir }}/local-claude"
+      - "Aider settings . {{ clients_bin_dir }}/aider.model.settings.yml"
+      - "Copies for other machines are in artifacts/clients/."
+      - "The wrapper UNSETS ANTHROPIC_API_KEY: a non-empty value takes
+         precedence and silently bills the real Anthropic API."

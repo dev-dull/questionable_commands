@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# homelab/ansible/roles/clients
+#
+# Point Claude Code at the homelab box instead of Anthropic's API.
+#
+# This exists as a WRAPPER, not as shell-profile exports, so that plain `claude`
+# keeps talking to the real API. Exporting these globally means every future
+# session silently uses a 20 GB local model, which is a confusing way to spend
+# an afternoon.
+
+set -euo pipefail
+
+export ANTHROPIC_BASE_URL={{ clients_endpoint }}
+export ANTHROPIC_AUTH_TOKEN=local
+
+# MUST be empty. A non-empty ANTHROPIC_API_KEY takes precedence and silently
+# sends your prompts to the real Anthropic API — billed, and off-LAN. Unsetting
+# is safer than setting it to "" because some versions treat empty and absent
+# differently.
+unset ANTHROPIC_API_KEY
+
+export ANTHROPIC_MODEL={{ clients_model }}
+export ANTHROPIC_SMALL_FAST_MODEL={{ clients_model }}
+
+# Claude Code hardcodes a 200k window for model IDs it doesn't recognise, which
+# includes every gateway alias. Left alone it won't compact until ~167k, by
+# which point llama.cpp has long since run out of context and started dropping
+# the oldest tokens without telling anyone.
+#
+# Derived from usable context PER SLOT (`-c` divided by `-np`), then held BELOW
+# it — see roles/clients/defaults/main.yml for why equalling the ceiling
+# deadlocks compaction.
+#
+# NOTE: this export WINS over anything you set in your shell. If you are
+# experimenting with the threshold, change clients_auto_compact_window and
+# re-run the role — exporting a different value before calling this script has
+# no effect, which is exactly how 2026-08-02 was misdiagnosed.
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW={{ clients_auto_compact_window }}
+
+# Fail loudly if the box is not reachable, rather than letting Claude Code fall
+# back to something unexpected.
+if ! curl -sf -m 5 "${ANTHROPIC_BASE_URL}/v1/models" >/dev/null; then
+    echo "local-claude: cannot reach ${ANTHROPIC_BASE_URL}" >&2
+    echo "  - is llama-swap up?   systemctl status llama-swap" >&2
+    echo "  - are you on the LAN? Phase 11 firewalls this to {{ aihost_lan_subnet }}" >&2
+    exit 1
+fi
+
+exec claude "$@"

@@ -1,0 +1,107 @@
+---
+# =============================================================================
+# Homelab AI host — HOST_SETUP.md as code.
+#
+# Phase numbers and tags match the runbook 1:1, so you can run any single phase:
+#   ansible-playbook site.yml --tags phase4
+#   ansible-playbook site.yml --tags storage
+#   ansible-playbook site.yml --check --diff
+#
+# Roles are ordered by dependency, not convenience. Phase 3 discovers the GPU's
+# NUMA node and persists it as a local fact; Phase 7 pins llama-server to it.
+# =============================================================================
+
+- name: Homelab AI host
+  hosts: aihost
+  become: true
+
+  pre_tasks:
+    - name: Stamp this run with a fresh timestamp
+      # NOT ansible_facts.date_time: this play caches facts for 24h (so a
+      # tagged partial run still knows the GPU's NUMA node), which means
+      # date_time is frozen at whenever the cache was filled. Baselines were
+      # being written hours-stale, and the dated filenames with them — which
+      # quietly breaks the whole "diff it against last month" workflow.
+      ansible.builtin.set_fact:
+        aihost_now: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        aihost_today: "{{ lookup('pipe', 'date -u +%F') }}"
+      tags: [always]
+
+    - name: Refuse to run against anything that is not Ubuntu Server
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_major_version | int >= 24
+        fail_msg: >-
+          This runbook targets Ubuntu 24.04 or 26.04 LTS
+          (found {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}).
+          See LOCAL_AI_PLAN.md, "Choosing the distribution", before deviating —
+          the ZFS-prebuilt-module and native-CUDA arguments are distro-specific.
+        success_msg: "{{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}"
+      tags: [always]
+
+    - name: Refuse to run the services as root
+      # Guards a mistake already made once: aihost_user defaulted to
+      # ansible_user_id, which is "root" under become. Everything this owns —
+      # /srv/models, the llama.cpp checkout, the llama-swap unit's User= — would
+      # have silently become root-owned, and nothing would have failed loudly.
+      ansible.builtin.assert:
+        that:
+          - aihost_user | length > 0
+          - aihost_user != "root"
+        fail_msg: >-
+          aihost_user resolved to '{{ aihost_user }}'. It must be the
+          unprivileged login user. Set ansible_user in the inventory.
+        success_msg: "Service user: {{ aihost_user }}"
+      tags: [always]
+
+    - name: State the standing hardware constraints
+      ansible.builtin.debug:
+        msg:
+          - "Do NOT flash the BIOS — the Xeons are engineering samples."
+          - "Memory stays at {{ aihost_expect_dimms }} DIMMs, 1 per channel."
+          - "The 8 TB has SMART errors: re-downloadable data only."
+          - "LAN-only service. Do not port-forward anything."
+      tags: [always]
+
+  roles:
+    - role: base
+      tags: [phase1, base]
+
+    - role: hardware
+      tags: [phase2, hardware]
+
+    - role: gpu
+      tags: [phase3, gpu]
+
+    - role: storage
+      tags: [phase4, storage]
+
+    - role: llama_cpp
+      tags: [phase5, llama_cpp, build]
+
+    - role: models
+      tags: [phase6, models]
+
+    - role: llama_swap
+      tags: [phase7, llama_swap, serve]
+
+    - role: docker_webui
+      tags: [phase8, docker, webui]
+
+    # Phase 9 (Lemonade) is deliberately not implemented. LOCAL_AI_PLAN.md puts
+    # it in the stack table as the "Demo layer — the 'look how easy this is'
+    # segment. Keep it, don't build on it", and describes it as a manager
+    # wrapped around llama.cpp rather than a different engine. HOST_SETUP.md's
+    # Phase 9 is three config lines under "follow the current install
+    # instructions". Nothing in the three real use cases depends on it, and its
+    # llamacpp_args blocks -ngl, which is exactly the MoE-offload knob this box
+    # is built around. Install it by hand for the camera.
+
+    - role: clients
+      tags: [phase10, clients]
+
+    # Last, deliberately: everything above must be working before the box stops
+    # accepting connections it has not been told to accept.
+    - role: firewall
+      tags: [phase11, firewall]

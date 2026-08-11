@@ -1,0 +1,27 @@
+---
+# Pin for repeatability. Set to "latest" to resolve the newest release at run
+# time — convenient, but then two converges can install different binaries.
+llama_swap_version: v245
+
+llama_swap_bin: /usr/local/bin/llama-swap
+llama_swap_config_dir: /etc/llama-swap
+llama_swap_config: "{{ llama_swap_config_dir }}/config.yaml"
+
+# 0.0.0.0 is deliberate — Open WebUI (in Docker) and other LAN clients need to
+# reach it. Phase 11's ufw rules are what keep this LAN-only, so do not run
+# this without them.
+llama_swap_listen: "0.0.0.0:{{ aihost_llama_swap_port }}"
+
+# Loading a 20 GB MoE off a spinning disk is not fast. llama-swap's default
+# health-check window is far too short for the coder model and it will kill the
+# server mid-load and report a startup failure.
+llama_swap_health_timeout: 900
+
+# Where to pin NUMA-affine models. Populated by Phase 3; -1 means the firmware
+# did not report GPU affinity and pinning is skipped.
+llama_swap_numa_node: "{{ ansible_local.aihost.gpu_numa_node | default(-1) }}"
+
+# Minimum usable context PER REQUEST (-c divided by -np). Claude Code sends a
+# large system prompt plus every tool definition on every turn; below ~48K it
+# starts rejecting requests outright. Set 0 to disable the check.
+llama_swap_min_ctx_per_slot: 49152

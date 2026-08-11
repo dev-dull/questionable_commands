@@ -1,0 +1,37 @@
+---
+# Host facts for the dual-Xeon box, read off the machine 2026-08-01.
+#
+#   lsblk -d -o NAME,SIZE,MODEL,TRAN
+#   ls -l /dev/disk/by-id/
+
+# The 8 TB — Seagate ST8000VX0022-2EJ112, currently /dev/sdb.
+# by-id, never /dev/sdX: kernel names are not stable across reboots.
+#
+# Deliberately empty here: the by-id path embeds the drive's serial, and this
+# repo is public. Set the real value in inventory/hosts.local.yml (gitignored):
+#
+#   all: {children: {aihost: {hosts: {clode: {aihost_tank_disk_by_id: /dev/disk/by-id/ata-...}}}}}
+#
+# Get it from `ls -l /dev/disk/by-id/`. Left empty, the storage role refuses to
+# provision and says why, and the hardware role skips SMART collection — the
+# same fail-loud behaviour as aihost_evaldata_disk_by_id below.
+aihost_tank_disk_by_id: ""
+
+# NO SPARE 1 TB IS FITTED. The box has exactly two disks: the 120 GB Kingston
+# boot SSD (sda) and the 8 TB above (sdb). Until a third disk goes in, there is
+# nowhere for not-re-downloadable data to live except the drive the plan says
+# must only hold re-downloadable data. Leaving this empty makes the storage role
+# skip provisioning and say so, rather than quietly putting eval data at risk.
+aihost_evaldata_disk_by_id: ""
+
+aihost_zed_email: ""
+
+# --- Discovered, for reference (the roles re-derive these; not authoritative) --
+# GPU:          NVIDIA TU104 [GeForce RTX 2080 Rev. A] at 0000:02:00.0
+# GPU NUMA node: 0        <- this is the <NODE> the Phase 7 config pins to
+# CPU:          "Genuine Intel(R) CPU 0000 @ 2.10GHz" x2, 40 threads
+#               (the 0000 model string confirms the engineering samples)
+# Memory:       node 0 = 31810 MB, node 1 = 30148 MB
+#               Note node 1 is ~1.6 GB smaller than node 0, so size the
+#               socket-pinned model against 30148 MB, not a flat "32 GB".
+# OS:           Ubuntu 26.04 LTS, kernel 7.0.0-28-generic

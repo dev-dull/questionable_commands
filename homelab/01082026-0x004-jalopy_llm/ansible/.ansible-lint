@@ -1,0 +1,15 @@
+---
+profile: production
+
+exclude_paths:
+  - .collections/
+  - .facts_cache/
+  - artifacts/
+
+skip_list:
+  # Hardware discovery genuinely needs shell pipelines (lspci, dmidecode,
+  # smartctl); every one of them is guarded with changed_when: false.
+  - command-instead-of-shell
+
+warn_list:
+  - experimental

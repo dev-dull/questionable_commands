@@ -1,0 +1,28 @@
+[Unit]
+Description=llama-swap — model-swapping front door for llama.cpp
+Documentation=https://github.com/mostlygeek/llama-swap
+# The models live on tank/models. Starting before the pool mounts gives you a
+# service that is up but cannot load a single model.
+After=network-online.target zfs-mount.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ aihost_user }}
+Group={{ aihost_user }}
+ExecStart={{ llama_swap_bin }} --config {{ llama_swap_config }} --listen {{ llama_swap_listen }}
+Restart=on-failure
+RestartSec=5
+
+# Both caches. llama-swap execs llama-server, which resolves -hf against
+# LLAMA_CACHE; without this the service would re-download into the user's home.
+Environment=LLAMA_CACHE={{ aihost_llama_cache }}
+Environment=HF_HOME={{ aihost_hf_home }}
+
+# A model load is a long, memory-hungry operation. Do not let systemd's default
+# oom handling take the whole service down with one llama-server.
+OOMPolicy=continue
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

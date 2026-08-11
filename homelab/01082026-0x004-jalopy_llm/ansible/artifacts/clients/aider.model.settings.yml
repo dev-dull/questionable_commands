@@ -1,0 +1,21 @@
+# Ansible managed
+# homelab/ansible/roles/clients
+#
+# Drop this in a repo as `.aider.model.settings.yml`, then:
+#   export OPENAI_API_BASE=http://192.168.1.223:8080/v1
+#   export OPENAI_API_KEY=local
+#   aider --model openai/coder --edit-format diff
+#
+# If you see repeated "SEARCH block not found", switch to --edit-format whole.
+# That failure means the model cannot reproduce existing code exactly enough for
+# a diff to apply — more likely on a Q4 quant than on a frontier model.
+
+- name: openai/coder
+  edit_format: diff
+  use_repo_map: true
+  extra_params:
+    # USABLE CONTEXT PER SLOT, not -c. `-c` is the total KV allocation and `-np`
+    # divides it between server slots, so -c 131072 -np 1 = 131072 per request.
+    # Setting this to -c on a multi-slot server sends prompts the server
+    # silently truncates. Same arithmetic as CLAUDE_CODE_AUTO_COMPACT_WINDOW.
+    max_input_tokens: 131072

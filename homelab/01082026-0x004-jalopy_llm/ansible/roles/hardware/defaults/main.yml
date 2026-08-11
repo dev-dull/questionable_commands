@@ -1,0 +1,23 @@
+---
+# The bandwidth baseline. Cheap (a few seconds) and the number the whole
+# LOCAL_AI_PLAN.md tok/s estimate hangs off, so it runs by default.
+hardware_run_mbw: true
+hardware_mbw_runs: 10
+hardware_mbw_size_mb: 1024
+
+# ~12 hours. Off by default; turn it on deliberately, then come back with
+#   ansible-playbook site.yml --tags hardware -e hardware_smart_report_only=true
+hardware_smart_long_test: false
+hardware_smart_report_only: false
+
+# SMART attributes that matter on a drive already known to be failing.
+# 5 reallocated, 187 uncorrectable, 188 command timeout, 197 pending, 198 offline uncorrectable.
+hardware_smart_attributes: [5, 187, 188, 197, 198]
+
+# Pull the recorded baselines back to the control node so they are in git,
+# not only on the box they describe.
+hardware_fetch_baselines: true
+
+# Rewrite today's baseline even if one already exists. Off by default so a
+# converged host reports changed=0.
+hardware_force_baseline: false

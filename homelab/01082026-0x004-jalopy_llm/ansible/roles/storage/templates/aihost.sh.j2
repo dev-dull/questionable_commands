@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+# homelab/ansible/roles/storage — do not edit on the host.
+#
+# These are two SEPARATE caches, which is why Phase 6 pre-warms through
+# llama.cpp's own downloader rather than `hf download`:
+#   LLAMA_CACHE — what llama.cpp's `-hf` flag reads and writes
+#   HF_HOME     — what the `hf` CLI and the Python libraries use
+export LLAMA_CACHE={{ aihost_llama_cache }}
+export HF_HOME={{ aihost_hf_home }}

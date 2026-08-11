@@ -1,0 +1,25 @@
+---
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      # The one that matters here: an inventory with real disk serials or a
+      # zed email is fine, an SSH key is not.
+      - id: detect-private-key
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: [--strict]
+
+  - repo: https://github.com/ansible/ansible-lint
+    rev: v25.1.2
+    hooks:
+      - id: ansible-lint
+        files: \.(yaml|yml)$

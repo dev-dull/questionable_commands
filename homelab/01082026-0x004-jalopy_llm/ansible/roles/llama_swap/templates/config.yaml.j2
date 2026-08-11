@@ -1,0 +1,33 @@
+# {{ ansible_managed }}
+# homelab/ansible/roles/llama_swap — do not edit on the host.
+#
+# One endpoint, both API dialects. llama-swap reads the `model` field on each
+# request, starts the right llama-server if it is not already up, and routes to
+# it. Claude Code asks for `coder` on /v1/messages; the eval harness asks for
+# `scorer` on /v1/chat/completions; neither has to know the other exists.
+#
+# Generated from aihost_models in inventory/group_vars/aihost.yml.
+
+# A 20 GB MoE loading off a 5400rpm disk takes far longer than the default
+# health-check window, which would kill it mid-load and report a start failure.
+healthCheckTimeout: {{ llama_swap_health_timeout }}
+
+models:
+{% for name, m in aihost_models.items() %}
+{%   set pinned = (m.numa_pinned | default(false)) and (llama_swap_numa_node | int >= 0) %}
+{%   set prefix = 'numactl --cpunodebind=' ~ llama_swap_numa_node ~ ' --membind=' ~ llama_swap_numa_node ~ ' ' if pinned else '' %}
+  {{ name }}:
+    # {{ m.role }} — {{ m.size_gb }} GB
+{%   if m.numa_pinned | default(false) and not pinned %}
+    # NOT pinned: Phase 3 reported no GPU NUMA affinity (numa_node = -1).
+{%   elif pinned %}
+    # Pinned to NUMA node {{ llama_swap_numa_node }}, which owns the GPU.
+{%   endif %}
+    cmd: >
+      {{ prefix }}{{ aihost_llama_cpp_path }}/build/bin/llama-server
+      --port ${PORT} --host 127.0.0.1
+      -hf {{ m.hf_repo }}:{{ m.quant }}
+      {{ m.args | trim }}
+    ttl: {{ m.ttl }}
+
+{% endfor %}

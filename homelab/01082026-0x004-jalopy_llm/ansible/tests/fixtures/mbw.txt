@@ -1,0 +1,3 @@
+AVG	Method: MEMCPY	Elapsed: 0.20174	MiB: 1024.00000	Copy: 5075.892 MiB/s
+AVG	Method: DUMB	Elapsed: 0.16988	MiB: 1024.00000	Copy: 6027.777 MiB/s
+AVG	Method: MCBLOCK	Elapsed: 0.10231	MiB: 1024.00000	Copy: 10008.795 MiB/s

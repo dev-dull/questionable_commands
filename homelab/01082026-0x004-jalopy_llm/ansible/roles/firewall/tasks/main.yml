@@ -1,0 +1,161 @@
+---
+# Phase 11 — Lock it down
+#
+# LAN-only. Nothing in this build is safe to expose to the internet, and none of
+# these ports should ever be port-forwarded.
+
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+# --- Do not lock yourself out -------------------------------------------------
+
+- name: Find every live SSH peer
+  # NOT ansible_facts.env.SSH_CLIENT: this play runs with become, and sudo
+  # scrubs SSH_CLIENT from the environment, so it is always empty here. Asking
+  # the kernel is both reliable and stricter — it covers every operator
+  # currently logged in, not just this play's own connection.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      ss -tnH state established '( sport = :22 )'
+      | awk '{print $4}' | sed 's/:[0-9]*$//' | sort -u
+    executable: /bin/bash
+  changed_when: false
+  check_mode: false
+  register: firewall_ssh_peers
+
+- name: Collect the peer addresses
+  ansible.builtin.set_fact:
+    firewall_peers: "{{ firewall_ssh_peers.stdout_lines | map('trim') | reject('equalto', '') | list }}"
+
+- name: Work out which peers fall outside the allowed subnet
+  # ipaddr(subnet) returns the address when it is inside the network and False
+  # when it is not, so selecting the truthy results and diffing gives exactly
+  # the addresses that would be cut off. (ansible.utils.in_network as a `reject`
+  # test does NOT work here — it evaluates false for in-range addresses too.)
+  ansible.builtin.set_fact:
+    firewall_outsiders: >-
+      {{ firewall_peers
+         | difference(firewall_peers | map('ansible.utils.ipaddr', aihost_lan_subnet) | select | list) }}
+
+- name: Confirm every SSH peer is covered by the allow rule
+  # ufw's default-deny takes effect the instant it is enabled. Any established
+  # session from outside aihost_lan_subnet is dropped on the next packet, and a
+  # headless box then needs a keyboard.
+  ansible.builtin.assert:
+    that:
+      - firewall_peers | length > 0
+      - firewall_outsiders | length == 0
+    fail_msg: >-
+      SSH peers {{ firewall_peers }} include {{ firewall_outsiders }}, which
+      {{ 'is' if firewall_outsiders | length == 1 else 'are' }} outside
+      {{ aihost_lan_subnet }}. Enabling ufw would drop that session and leave a
+      headless box needing physical access. Widen aihost_lan_subnet, or set
+      firewall_require_ssh_covered=false if you have console access.
+    success_msg: "SSH peers {{ firewall_peers | join(', ') }} are inside {{ aihost_lan_subnet }}"
+  when: firewall_require_ssh_covered | bool
+
+# --- Rules before enabling ----------------------------------------------------
+
+- name: Read the firewall state before changing anything
+  ansible.builtin.command: ufw status verbose
+  changed_when: false
+  check_mode: false
+  register: firewall_status_pre
+
+- name: Note whether the firewall is already up
+  # The rollback timer only earns its keep on the run that actually enables the
+  # firewall. Arming and disarming it unconditionally would report changed on
+  # every converge and destroy `changed` as a drift signal.
+  ansible.builtin.set_fact:
+    firewall_arming_needed: >-
+      {{ firewall_enabled | bool
+         and firewall_rollback_seconds | int > 0
+         and 'Status: active' not in firewall_status_pre.stdout }}
+
+- name: Arm a rollback timer before touching the firewall
+  # Dead-man's switch. If the rules turn out to be wrong and this play loses the
+  # host mid-run, the timer disables ufw and the box comes back on its own
+  # instead of needing a keyboard and a monitor. Disarmed once connectivity is
+  # re-verified below.
+  ansible.builtin.command:
+    argv:
+      - systemd-run
+      - "--on-active={{ firewall_rollback_seconds }}"
+      - --unit=ufw-rollback
+      - --description=Disable ufw if the play did not confirm connectivity
+      - /usr/sbin/ufw
+      - --force
+      - disable
+  changed_when: true
+  when: firewall_arming_needed | bool
+
+- name: Default deny incoming
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: Default allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+- name: Allow the service ports from the LAN only
+  # `proto tcp` must come before `from`, and the protocol is mandatory when
+  # listing several ports — which is why the runbook writes it this way. The
+  # module handles the ordering for us.
+  community.general.ufw:
+    rule: allow
+    proto: tcp
+    src: "{{ aihost_lan_subnet }}"
+    port: "{{ aihost_allowed_tcp_ports | join(',') }}"
+    comment: "homelab AI host — LAN only"
+
+- name: Enable ufw
+  community.general.ufw:
+    state: "{{ 'enabled' if firewall_enabled else 'disabled' }}"
+
+# --- Verify -------------------------------------------------------------------
+
+- name: Read the ruleset
+  ansible.builtin.command: ufw status verbose
+  changed_when: false
+  register: firewall_status
+
+- name: Assert the firewall is actually on and default-deny
+  ansible.builtin.assert:
+    that:
+      - "'Status: active' in firewall_status.stdout"
+      - "'deny (incoming)' in firewall_status.stdout"
+    fail_msg: "ufw is not in the expected state:\n{{ firewall_status.stdout }}"
+    success_msg: "ufw active, default deny incoming"
+  when: firewall_enabled | bool
+
+- name: Confirm SSH still works after enabling
+  # If this fails you will find out here rather than on your next connection —
+  # and the rollback timer below will not be disarmed, so the box recovers.
+  ansible.builtin.ping:
+
+- name: Disarm the rollback timer
+  # Only reached if the ping above succeeded, i.e. the firewall is up AND this
+  # connection survived it.
+  ansible.builtin.systemd_service:
+    name: ufw-rollback.timer
+    state: stopped
+  failed_when: false
+  when: firewall_arming_needed | bool
+
+- name: Phase 11 checkpoint
+  ansible.builtin.debug:
+    msg:
+      - "ufw active — deny incoming, allow outgoing"
+      - "Allowed from {{ aihost_lan_subnet }}: tcp {{ aihost_allowed_tcp_ports | join(', ') }}"
+      - "Live SSH peers {{ firewall_peers | join(', ') }} — still reachable."
+      - "CAVEAT: Docker publishes container ports by writing its own iptables
+         rules in the DOCKER-USER chain, which are evaluated BEFORE ufw. ufw
+         rules therefore do NOT filter published container ports such as
+         {{ aihost_webui_port }}. Open WebUI is bound to {{ aihost_lan_ip }}
+         rather than 0.0.0.0 to limit this, but if this box ever gains a public
+         interface, add an explicit DOCKER-USER rule. Do not port-forward."

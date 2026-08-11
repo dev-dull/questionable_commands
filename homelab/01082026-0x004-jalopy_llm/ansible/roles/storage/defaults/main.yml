@@ -1,0 +1,21 @@
+---
+# ashift=12 for 4K sectors; compression off because GGUF is already compressed
+# and the CPU is better spent on inference.
+storage_zpool_ashift: 12
+storage_zpool_compression: "off"
+
+# copies=2 is the whole point: the 8 TB has SMART errors, and two copies of
+# every block let a scrub repair bad sectors instead of just reporting them.
+# It halves usable capacity. That is the trade, deliberately.
+storage_models_copies: 2
+storage_models_recordsize: 1M
+
+storage_scrub_timer: "zfs-scrub-monthly@{{ aihost_zpool_name }}.timer"
+
+# Mail scrub/fault notifications. Requires a working MTA on the host; without
+# one, zed logs to syslog and this is inert but harmless.
+storage_zed_notify_verbose: true
+
+# Refuse to touch a disk that already has a filesystem or partition table on it.
+# Overriding this is how you overwrite the wrong drive.
+storage_require_blank_disks: true

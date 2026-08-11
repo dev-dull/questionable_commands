@@ -1,0 +1,225 @@
+---
+# Phase 5 — Build llama.cpp with CUDA
+
+# The runbook chowns all of /opt to the build user. Narrower is better: only the
+# checkout needs to be user-writable.
+- name: Ensure /opt exists
+  ansible.builtin.file:
+    path: /opt
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create the llama.cpp tree owned by the service user
+  ansible.builtin.file:
+    path: "{{ aihost_llama_cpp_path }}"
+    state: directory
+    owner: "{{ aihost_user }}"
+    group: "{{ aihost_user }}"
+    mode: "0755"
+
+- name: Check out llama.cpp
+  become: true
+  become_user: "{{ aihost_user }}"
+  ansible.builtin.git:
+    repo: "{{ aihost_llama_cpp_repo }}"
+    dest: "{{ aihost_llama_cpp_path }}"
+    version: "{{ aihost_llama_cpp_ref }}"
+    # Shallow-clone only when tracking a branch. `git fetch --depth=1 <sha>`
+    # needs the server to allow fetching an arbitrary object, so a pinned SHA
+    # would fail on a fresh host even though it works on one already cloned.
+    depth: "{{ 1 if aihost_llama_cpp_ref in ['master', 'main', 'HEAD'] else omit }}"
+    force: true
+  register: llama_cpp_checkout
+
+- name: Warn that the build is not pinned
+  ansible.builtin.debug:
+    msg: >-
+      aihost_llama_cpp_ref is "{{ aihost_llama_cpp_ref }}", so this build tracks
+      upstream and is not reproducible. Pin it to a tag or SHA
+      ({{ llama_cpp_checkout.after | default('unknown') }} is what you just
+      built) once you have a combination you like.
+  when: aihost_llama_cpp_ref in ["master", "main", "HEAD"]
+
+# --- Decide whether a rebuild is actually needed -------------------------------
+
+- name: Describe the build we want
+  # Source revision plus every CMake flag, so changing an option forces a
+  # rebuild rather than silently leaving a stale binary in place.
+  ansible.builtin.set_fact:
+    llama_cpp_want_stamp: >-
+      {{ llama_cpp_checkout.after | default('unknown') }}
+      {{ llama_cpp_cmake_options.items() | map('join', '=') | sort | join(' ') }}
+
+- name: Read the previous build stamp
+  ansible.builtin.slurp:
+    src: "{{ llama_cpp_stamp }}"
+  register: llama_cpp_have_stamp
+  failed_when: false
+
+- name: Check whether llama-server is present
+  ansible.builtin.stat:
+    path: "{{ llama_cpp_bin_dir }}/llama-server"
+  register: llama_cpp_server_bin
+
+- name: Decide on a rebuild
+  ansible.builtin.set_fact:
+    llama_cpp_needs_build: >-
+      {{ not llama_cpp_server_bin.stat.exists
+         or llama_cpp_have_stamp.content is not defined
+         or (llama_cpp_have_stamp.content | b64decode | trim) != (llama_cpp_want_stamp | trim) }}
+
+- name: Report the build decision
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Rebuilding llama.cpp.' if llama_cpp_needs_build
+         else 'llama.cpp is up to date — skipping the build.' }}
+
+# --- Build --------------------------------------------------------------------
+
+- name: Build llama.cpp
+  when: llama_cpp_needs_build | bool
+  become: true
+  become_user: "{{ aihost_user }}"
+  block:
+    - name: Configure the CMake build
+      ansible.builtin.command:
+        argv: "{{ ['cmake', '-B', llama_cpp_build_dir] + llama_cpp_defines }}"
+        chdir: "{{ aihost_llama_cpp_path }}"
+      vars:
+        llama_cpp_defines: >-
+          {{ llama_cpp_cmake_options.items() | map('join', '=')
+             | map('regex_replace', '^', '-D') | list }}
+      changed_when: true
+
+    - name: Compile
+      # CMAKE_CUDA_ARCHITECTURES=75 targets Turing only, which is most of why
+      # this finishes in a reasonable time on a 2016 platform.
+      ansible.builtin.command:
+        argv:
+          - cmake
+          - --build
+          - "{{ llama_cpp_build_dir }}"
+          - --config
+          - Release
+          - -j
+          - "{{ aihost_build_jobs }}"
+        chdir: "{{ aihost_llama_cpp_path }}"
+      changed_when: true
+
+    - name: Record the build stamp
+      ansible.builtin.copy:
+        content: "{{ llama_cpp_want_stamp | trim }}\n"
+        dest: "{{ llama_cpp_stamp }}"
+        owner: "{{ aihost_user }}"
+        group: "{{ aihost_user }}"
+        mode: "0644"
+
+# --- Checkpoint ---------------------------------------------------------------
+
+- name: Read the llama-server version
+  ansible.builtin.command: "{{ llama_cpp_bin_dir }}/llama-server --version"
+  changed_when: false
+  register: llama_cpp_version
+  # llama-server --version writes to stderr and exits non-zero on some builds.
+  failed_when: false
+
+- name: Stat the expected binaries
+  ansible.builtin.stat:
+    path: "{{ llama_cpp_bin_dir }}/{{ item }}"
+  loop: [llama-server, llama-bench, llama-cli]
+  register: llama_cpp_bins
+
+- name: Assert the expected binaries exist
+  ansible.builtin.assert:
+    that:
+      - llama_cpp_bins.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      Build did not produce:
+      {{ llama_cpp_bins.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}
+    success_msg: "llama-server, llama-bench, llama-cli present"
+
+- name: Confirm the build actually has CUDA in it
+  # A CUDA-less build silently falls back to CPU and every tok/s number in
+  # LOCAL_AI_PLAN.md becomes wrong. Cheaper to catch here.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      ldd {{ llama_cpp_bin_dir }}/llama-server | grep -ci 'libcud[a|art]' || true
+    executable: /bin/bash
+  changed_when: false
+  register: llama_cpp_cuda_linked
+
+- name: Assert CUDA is linked in
+  ansible.builtin.assert:
+    that:
+      - llama_cpp_cuda_linked.stdout | int > 0
+    fail_msg: >-
+      llama-server is not linked against CUDA. The build fell back to CPU-only.
+      Check that nvcc was on PATH during the build and rebuild with
+      --tags phase5 after deleting {{ llama_cpp_stamp }}.
+    success_msg: "CUDA linked"
+
+- name: Confirm the build has HTTPS support
+  # Learned the hard way: a build with CUDA but without TLS looks completely
+  # healthy — it starts, reports its version, lists CUDA0 — and then fails at
+  # the first `-hf` with "HTTPS is not supported". Every model in Phases 6 and 7
+  # is fetched by `-hf`, so this is as load-bearing as the CUDA check.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      ldd {{ llama_cpp_bin_dir }}/llama-server | grep -ci 'libssl\|libcrypto' || true
+    executable: /bin/bash
+  changed_when: false
+  register: llama_cpp_ssl_linked
+
+- name: Assert HTTPS is available
+  ansible.builtin.assert:
+    that:
+      - llama_cpp_ssl_linked.stdout | int > 0
+    fail_msg: >-
+      llama-server has no TLS support, so `-hf` cannot download models.
+      Install libssl-dev (Phase 1) and rebuild: delete {{ llama_cpp_stamp }}
+      and re-run --tags phase5.
+    success_msg: "HTTPS linked"
+
+- name: Run the llama-bench baseline
+  ansible.builtin.command:
+    argv: >-
+      {{ [llama_cpp_bin_dir ~ '/llama-bench',
+          '-m', llama_cpp_bench_model,
+          '-ngl', llama_cpp_bench_ngl | string]
+         + (llama_cpp_bench_extra | split if llama_cpp_bench_extra | length > 0 else []) }}
+  changed_when: false
+  when: llama_cpp_bench_model | length > 0
+  register: llama_cpp_bench
+  tags: [bench]
+
+- name: Record the benchmark baseline
+  ansible.builtin.copy:
+    content: |
+      # llama-bench baseline — {{ aihost_now }}
+      # ref: {{ llama_cpp_checkout.after | default(aihost_llama_cpp_ref) }}
+      # model: {{ llama_cpp_bench_model }}
+      {{ llama_cpp_bench.stdout }}
+    dest: "{{ aihost_state_dir }}/baselines/llama-bench-{{ aihost_today }}.txt"
+    owner: root
+    group: root
+    mode: "0644"
+  when: llama_cpp_bench.stdout is defined
+  tags: [bench]
+
+- name: Phase 5 checkpoint
+  tags: [bench]
+  ansible.builtin.debug:
+    msg:
+      - "Version: {{ (llama_cpp_version.stdout | default('')) ~ (llama_cpp_version.stderr | default('')) | trim }}"
+      - "Binaries: {{ llama_cpp_bin_dir }}"
+      - "CUDA: linked"
+      - "HTTPS: linked"
+      - "Bench: {{ 'recorded — read pp512 and tg128 out of the baseline file'
+                   if llama_cpp_bench.stdout is defined
+                   else 'skipped, no GGUF on the box yet. After Phase 6, re-run
+                         --tags bench with -e llama_cpp_bench_model=<path> and
+                         record pp512 / tg128.' }}"

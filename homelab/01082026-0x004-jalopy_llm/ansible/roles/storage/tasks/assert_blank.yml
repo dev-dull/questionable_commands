@@ -1,0 +1,36 @@
+---
+# Guard against formatting the wrong disk.
+#
+# Inputs:  blank_disk_path  — a /dev/disk/by-id/... path
+#          blank_disk_label — human name for the error message
+# Outputs: storage_blank_disk_has_fs — true if the disk already carries data
+#
+# This is advisory-but-loud: it refuses outright unless the caller has set
+# storage_require_blank_disks to false. It exists because `lsblk` output and a
+# tired operator are the two things standing between you and the wrong drive.
+
+- name: "Inspect the target disk for existing content — {{ blank_disk_label }}"
+  ansible.builtin.command: "lsblk -no FSTYPE,PTTYPE,MOUNTPOINT {{ blank_disk_path }}"
+  changed_when: false
+  register: storage_blank_probe
+
+- name: Decide whether the disk carries data
+  ansible.builtin.set_fact:
+    storage_blank_disk_has_fs: "{{ (storage_blank_probe.stdout | trim | length) > 0 }}"
+
+- name: "Refuse to overwrite {{ blank_disk_label }}"
+  ansible.builtin.assert:
+    that:
+      - not storage_blank_disk_has_fs
+    fail_msg: |
+      {{ blank_disk_path }} is not blank — it already has a filesystem,
+      partition table, or mount:
+
+      {{ storage_blank_probe.stdout }}
+
+      If this really is the {{ blank_disk_label }} and you mean to destroy it,
+      wipe it by hand (wipefs -a) and re-run. This playbook will not do that
+      for you. If it is NOT that disk, you just avoided an expensive mistake.
+  when:
+    - storage_require_blank_disks | bool
+    - storage_blank_disk_has_fs
