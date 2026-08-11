@@ -55,7 +55,9 @@ Not measured this run (`hardware_run_mbw: false`).
 ```
 
 {% if hardware_smart_tracked is defined %}
-## SMART — the 8 TB ({{ aihost_tank_disk_by_id }})
+{# Deliberately not printing aihost_tank_disk_by_id: the by-id path embeds the
+   drive serial, and this artifact is committed to a public repo. #}
+## SMART — the 8 TB
 
 This drive has known errors. Only re-downloadable data lives on it.
 

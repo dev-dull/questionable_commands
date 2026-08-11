@@ -4,9 +4,18 @@
 #   lsblk -d -o NAME,SIZE,MODEL,TRAN
 #   ls -l /dev/disk/by-id/
 
-# The 8 TB — Seagate ST8000VX0022-2EJ112, serial REDACTED, currently /dev/sdb.
+# The 8 TB — Seagate ST8000VX0022-2EJ112, currently /dev/sdb.
 # by-id, never /dev/sdX: kernel names are not stable across reboots.
-aihost_tank_disk_by_id: /dev/disk/by-id/ata-ST8000VX0022-2EJ112_REDACTED
+#
+# Deliberately empty here: the by-id path embeds the drive's serial, and this
+# repo is public. Set the real value in inventory/hosts.local.yml (gitignored):
+#
+#   all: {children: {aihost: {hosts: {clode: {aihost_tank_disk_by_id: /dev/disk/by-id/ata-...}}}}}
+#
+# Get it from `ls -l /dev/disk/by-id/`. Left empty, the storage role refuses to
+# provision and says why, and the hardware role skips SMART collection — the
+# same fail-loud behaviour as aihost_evaldata_disk_by_id below.
+aihost_tank_disk_by_id: ""
 
 # NO SPARE 1 TB IS FITTED. The box has exactly two disks: the 120 GB Kingston
 # boot SSD (sda) and the 8 TB above (sdb). Until a third disk goes in, there is

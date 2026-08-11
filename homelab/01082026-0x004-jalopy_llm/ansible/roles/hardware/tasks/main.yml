@@ -116,7 +116,11 @@
 # --- Disks --------------------------------------------------------------------
 
 - name: Inventory the block devices
-  ansible.builtin.command: lsblk -o NAME,SIZE,MODEL,SERIAL,MOUNTPOINT
+  # No SERIAL column on purpose: this output is rendered verbatim into the
+  # committed baseline artifact, and this repo is public. MODEL is enough to
+  # tell the disks apart; run `lsblk -o NAME,SIZE,MODEL,SERIAL` by hand when you
+  # actually need a serial for an RMA.
+  ansible.builtin.command: lsblk -o NAME,SIZE,MODEL,MOUNTPOINT
   changed_when: false
   register: hardware_lsblk
 
