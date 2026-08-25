@@ -6,3 +6,4 @@
 
 # Go build output
 homelab/01082026-0x004-jalopy_llm/hello-go/hello-go
+docs/**
