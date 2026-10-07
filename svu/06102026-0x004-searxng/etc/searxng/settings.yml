@@ -1,0 +1,16 @@
+use_default_settings: true
+
+general:
+  instance_name: SearXNG
+
+server:
+  secret_key: YOUR-64-CHAR-SECRET-GOES-HERE
+  # limiter: true  # If you ever expose this to the internet, enable this line so that bots are at least rate limited.
+  image_proxy: true
+search:
+  formats:
+    - html
+    - json
+
+valkey:
+  url: redis://valkey:6379/0
